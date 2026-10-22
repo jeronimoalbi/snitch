@@ -1,0 +1,15 @@
+[Unit]
+Description=snitch - GTK prompt for the OpenSnitch daemon
+Documentation=https://github.com/jeronimoalbi/snitch
+PartOf=graphical-session.target
+After=graphical-session.target
+
+[Service]
+ExecStart=/usr/bin/snitch
+Restart=on-failure
+RestartSec=2
+NoNewPrivileges=true
+# No PrivateTmp: the root daemon connects to the real /tmp/osui.sock.
+
+[Install]
+WantedBy=graphical-session.target
