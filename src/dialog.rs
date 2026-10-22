@@ -348,7 +348,7 @@ impl Dialog {
             titles.append(&l);
         }
 
-        let details_btn = gtk::Button::from_icon_name("dialog-information-symbolic");
+        let details_btn = gtk::Button::from_icon_name("view-reveal-symbolic");
         details_btn.add_css_class("flat");
         details_btn.set_valign(gtk::Align::Start);
         details_btn.set_tooltip_text(Some("Process details"));
