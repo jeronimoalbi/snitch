@@ -115,6 +115,6 @@ pkill opensnitch-ui                                    # otherwise
 | Hyprland, Sway, KDE (Wayland)| Honoured               | Overlay layer, anchored to corner |
 | GNOME (Wayland), X11         | Ignored                | Normal window, placed by compositor |
 
-## Not implemented yet
+## Scope
 
-- Writing settings back to the Qt settings file.
+Settings are read-only. The Qt prompt only ever saves its own window geometry, which has no meaning for a fixed-size window, so snitch never writes to the Qt settings file. Change defaults in the Qt preferences.
