@@ -177,6 +177,7 @@ fn run_daemon(
     }
 
     let (prompts, requests) = async_channel::unbounded::<PromptRequest>();
+    let bus_settings = settings_path.clone();
     let service = Service::new(prompts, settings_path);
     let link = service.link();
     link.keep_pause_in(glib::user_runtime_dir().join("snitch-paused"));
@@ -209,7 +210,7 @@ fn run_daemon(
         }
         std::process::exit(0);
     });
-    bus::serve(updater);
+    bus::serve(updater, bus_settings);
 
     // Prompts are handled one after another on the GTK thread.
     let prompt_app = app.clone();

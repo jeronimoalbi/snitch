@@ -6,6 +6,7 @@
 //! through polkit, because any program of the user could call this service.
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use gtk4::gio::{self, BusNameOwnerFlags, BusType, DBusConnection, DBusMethodInvocation};
 use gtk4::glib::prelude::ToVariant;
@@ -31,18 +32,21 @@ const XML: &str = r#"
     <property name="Version" type="u" access="read"/>
     <property name="Interception" type="s" access="read"/>
     <property name="Connected" type="b" access="read"/>
+    <property name="SettingsPath" type="s" access="read"/>
     <method name="Enable"/>
     <method name="Disable"/>
   </interface>
 </node>"#;
 
 /// Starts offering the service on the session bus.
-pub fn serve(updater: Updater) {
+/// `settings` is the OpenSnitch settings file snitch reads, offered as the
+/// `SettingsPath` property so other programs edit the same file.
+pub fn serve(updater: Updater, settings: PathBuf) {
     gio::bus_own_name(
         BusType::Session,
         NAME,
         BusNameOwnerFlags::DO_NOT_QUEUE,
-        move |connection, _| match register(&connection, &updater) {
+        move |connection, _| match register(&connection, &updater, &settings) {
             Ok(()) => tracing::info!("D-Bus service {NAME} ready"),
             Err(err) => tracing::warn!("cannot offer {NAME} on D-Bus: {err}"),
         },
@@ -51,7 +55,11 @@ pub fn serve(updater: Updater) {
     );
 }
 
-fn register(connection: &DBusConnection, updater: &Updater) -> Result<(), glib::Error> {
+fn register(
+    connection: &DBusConnection,
+    updater: &Updater,
+    settings: &Path,
+) -> Result<(), glib::Error> {
     let node = gio::DBusNodeInfo::for_xml(XML)?;
     let interface = node
         .lookup_interface(INTERFACE)
@@ -59,12 +67,13 @@ fn register(connection: &DBusConnection, updater: &Updater) -> Result<(), glib::
 
     let calls = updater.clone();
     let reads = updater.clone();
+    let settings = settings.to_path_buf();
     connection
         .register_object(PATH, &interface)
         .method_call(move |connection, sender, _, _, method, _, invocation| {
             call(&calls, &connection, sender, method, invocation);
         })
-        .property(move |_, _, _, _, name| property(reads.status(), name))
+        .property(move |_, _, _, _, name| property(reads.status(), &settings, name))
         .build()?;
 
     let connection = connection.clone();
@@ -81,11 +90,12 @@ fn register(connection: &DBusConnection, updater: &Updater) -> Result<(), glib::
 }
 
 /// Value of the property `name`.
-fn property(state: DaemonState, name: &str) -> Variant {
+fn property(state: DaemonState, settings: &Path, name: &str) -> Variant {
     match name {
         "Version" => VERSION.to_variant(),
         "Interception" => state.interception.as_str().to_variant(),
         "Connected" => state.connected.to_variant(),
+        "SettingsPath" => settings.to_string_lossy().to_variant(),
         _ => ().to_variant(),
     }
 }
@@ -290,8 +300,21 @@ mod tests {
             connected: true,
             interception: Interception::Off,
         };
-        assert_eq!(property(state, "Interception").str(), Some("off"));
-        assert_eq!(property(state, "Connected").get::<bool>(), Some(true));
-        assert_eq!(property(state, "Version").get::<u32>(), Some(VERSION));
+        assert_eq!(
+            property(state, Path::new("/x"), "Interception").str(),
+            Some("off")
+        );
+        assert_eq!(
+            property(state, Path::new("/x"), "Connected").get::<bool>(),
+            Some(true)
+        );
+        assert_eq!(
+            property(state, Path::new("/x"), "Version").get::<u32>(),
+            Some(VERSION)
+        );
+        assert_eq!(
+            property(state, Path::new("/a/settings.conf"), "SettingsPath").str(),
+            Some("/a/settings.conf")
+        );
     }
 }

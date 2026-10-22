@@ -32,6 +32,7 @@ const INTERFACE_XML = `
     <property name="Version" type="u" access="read"/>
     <property name="Interception" type="s" access="read"/>
     <property name="Connected" type="b" access="read"/>
+    <property name="SettingsPath" type="s" access="read"/>
     <method name="Enable"/>
     <method name="Disable"/>
   </interface>
@@ -220,6 +221,7 @@ const Indicator = GObject.registerClass(
             this._promptNote = new PopupMenu.PopupMenuItem('', { reactive: false });
             this._prompt.menu.addMenuItem(this._promptNote);
             this._saving = Promise.resolve();
+            this._promptPath = null;
 
             const menu = this.menu;
             menu.addMenuItem(this._status);
@@ -244,20 +246,34 @@ const Indicator = GObject.registerClass(
             this._readPrompt();
         }
 
+        // The settings file snitch uses, or null while that is not known: snitch
+        // not running, or too old to say. Never guessed, so the menu can't show
+        // or change a file snitch doesn't read.
+        _settingsPath() {
+            const proxy = this._proxy;
+            const path = proxy && proxy.g_name_owner ? proxy.SettingsPath : null;
+            return typeof path === 'string' && path !== '' ? path : null;
+        }
+
         async _readPrompt() {
+            const path = this._settingsPath();
+            this._promptPath = path;
             let values = null;
-            try {
-                values = await loadSettings();
-            } catch (error) {
-                console.error(`snitch: cannot read the settings: ${error.message}`);
+            let problem = 'Snitch is not running, or too old to say which file it uses';
+            if (path !== null) {
+                try {
+                    values = await loadSettings(path);
+                } catch (error) {
+                    problem = 'Cannot read the OpenSnitch settings';
+                    console.error(`snitch: cannot read ${path}: ${error.message}`);
+                }
             }
-            if (this._destroyed) {
+            // Snitch may have restarted with another file while reading.
+            if (this._destroyed || path !== this._settingsPath()) {
                 return;
             }
             const editable = values !== null;
-            this._promptNote.label.text = editable
-                ? 'Applies to the next prompt'
-                : 'Cannot read the OpenSnitch settings';
+            this._promptNote.label.text = editable ? 'Applies to the next prompt' : problem;
             for (const [name, stepper] of Object.entries(this._steppers)) {
                 stepper.setSensitive(editable);
                 if (editable) {
@@ -276,8 +292,14 @@ const Indicator = GObject.registerClass(
         // with the last value in the file.
         _savePrompt(name, value) {
             this._saving = this._saving.then(async () => {
+                // Only the file that is shown; if snitch has moved to another, the
+                // change is dropped and the menu shows the new file.
+                const path = this._settingsPath();
                 try {
-                    await saveSetting(name, value);
+                    if (path === null || path !== this._promptPath) {
+                        throw new Error('snitch now uses another settings file');
+                    }
+                    await saveSetting(name, value, path);
                 } catch (error) {
                     Main.notifyError('Snitch', `Cannot save the setting: ${error.message}`);
                     // Show what the file says, which undoes the change.
@@ -321,6 +343,10 @@ const Indicator = GObject.registerClass(
             this._firewall.setSensitive(state !== 'unknown' && !this._busy);
             // Starting only makes sense when snitch is not there at all.
             this._start.visible = !(proxy && proxy.g_name_owner);
+            // The file can change when snitch (re)starts.
+            if (this._settingsPath() !== this._promptPath) {
+                this._readPrompt();
+            }
         }
 
         _showAutostart() {

@@ -78,8 +78,8 @@ what OpenSnitch is there to catch. Leave the rule out unless you accept that.
 ## Prompt defaults
 
 The same options as in the OpenSnitch preferences, so you don't have to open
-the Qt window. They are read from and saved to
-`~/.config/opensnitch/settings.conf`, the file the Qt UI uses.
+the Qt window. They are read from and saved to the OpenSnitch settings file,
+by default `~/.config/opensnitch/settings.conf`, the file the Qt UI uses.
 
 | Option                    | What it sets                                |
 |---------------------------|---------------------------------------------|
@@ -102,8 +102,9 @@ Some things to know:
 
 - The position of the prompt is not offered: GNOME doesn't let a program place
   its own windows, so the setting has no effect here.
-- If you started snitch with `--settings`, the menu still edits the default
-  file.
+- Snitch tells the extension which file it reads, so `--settings` is followed.
+  While snitch isn't running (or is too old to say), the options are greyed
+  out, so the menu never shows or changes a file snitch doesn't use.
 - The menu shows the file as it is each time it opens, so a change made in the
   Qt UI shows up there.
 - "Time to answer" stepping never offers `0` (never ask, apply the default).
@@ -126,6 +127,7 @@ Snitch offers this interface on the session bus, as
 | `Version`      | Interface version, currently 1                    |
 | `Interception` | `on`, `off` or `unknown`                          |
 | `Connected`    | The daemon is connected to snitch                 |
+| `SettingsPath` | The OpenSnitch settings file snitch reads         |
 | `Enable()`     | Turn the firewall on                              |
 | `Disable()`    | Turn the firewall off, after polkit authorises it |
 
