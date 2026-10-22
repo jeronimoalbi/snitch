@@ -190,8 +190,13 @@ const Indicator = GObject.registerClass(
             this._status = new PopupMenu.PopupMenuItem('', { reactive: false });
             this._firewall = new PopupMenu.PopupSwitchMenuItem('Enable firewall', false);
             this._firewall.connect('toggled', (_item, on) => this._setFirewall(on));
-            this._start = new PopupMenu.PopupMenuItem('Start snitch now');
-            this._start.connect('activate', () => this._startSnitch());
+            this._running = new PopupMenu.PopupSwitchMenuItem('Snitch running', false);
+            this._running.connect('toggled', (_item, on) => this._setRunning(on));
+            // Whether snitch had the bus name at the last look; null until known.
+            this._owned = null;
+            // What a switch click asked for, shown until snitch catches up.
+            this._wanted = null;
+            this._wantedTimer = 0;
             this._login = new PopupMenu.PopupSwitchMenuItem('Start snitch on login', false);
             this._login.connect('toggled', (_item, on) => this._setAutostart(on));
             this._loginNote = new PopupMenu.PopupMenuItem('', { reactive: false });
@@ -226,7 +231,7 @@ const Indicator = GObject.registerClass(
             const menu = this.menu;
             menu.addMenuItem(this._status);
             menu.addMenuItem(this._firewall);
-            menu.addMenuItem(this._start);
+            menu.addMenuItem(this._running);
             menu.addMenuItem(this._login);
             menu.addMenuItem(this._loginNote);
             menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
@@ -341,8 +346,19 @@ const Indicator = GObject.registerClass(
             this._status.label.text = STATES[state].label;
             this._firewall.setToggleState(state === 'on');
             this._firewall.setSensitive(state !== 'unknown' && !this._busy);
-            // Starting only makes sense when snitch is not there at all.
-            this._start.visible = !(proxy && proxy.g_name_owner);
+
+            const owned = Boolean(proxy && proxy.g_name_owner);
+            if (proxy && this._owned !== null && owned !== this._owned) {
+                this._announceRunning(owned);
+            }
+            if (proxy) {
+                this._owned = owned;
+            }
+            if (this._wanted === owned) {
+                this._clearWanted();
+            }
+            this._running.setToggleState(this._wanted ?? owned);
+            this._running.setSensitive(proxy !== null && !this._busy);
             // The file can change when snitch (re)starts.
             if (this._settingsPath() !== this._promptPath) {
                 this._readPrompt();
@@ -396,12 +412,52 @@ const Indicator = GObject.registerClass(
             }
         }
 
-        async _startSnitch() {
+        // Tells the user when snitch starts or stops, whoever did it: the
+        // switch, systemctl, or a crash.
+        _announceRunning(running) {
+            if (running) {
+                Main.notify('Snitch started', 'OpenSnitch asks about new connections.');
+            } else {
+                Main.notify('Snitch stopped',
+                    'Nothing asks about connections now. The OpenSnitch daemon ' +
+                    'applies its own default action.');
+            }
+        }
+
+        _clearWanted() {
+            this._wanted = null;
+            if (this._wantedTimer) {
+                GLib.source_remove(this._wantedTimer);
+                this._wantedTimer = 0;
+            }
+        }
+
+        async _setRunning(on) {
+            if (this._busy || !this._proxy) {
+                return;
+            }
+            this._busy = true;
+            this._wanted = on;
+            this._sync();
             try {
-                await systemd('StartUnit',
+                await systemd(on ? 'StartUnit' : 'StopUnit',
                     new GLib.Variant('(ss)', [UNIT, 'replace']), '(o)');
+                // The job is queued; the name appears or goes a moment later.
+                // If it doesn't within a while, show what is true.
+                this._wantedTimer = GLib.timeout_add_seconds(GLib.PRIORITY_DEFAULT, 10, () => {
+                    this._wantedTimer = 0;
+                    this._wanted = null;
+                    this._sync();
+                    return GLib.SOURCE_REMOVE;
+                });
             } catch (error) {
+                this._wanted = null;
                 Main.notifyError('Snitch', Gio.DBusError.strip_remote_error(error) ?? `${error}`);
+            } finally {
+                this._busy = false;
+                if (!this._destroyed) {
+                    this._sync();
+                }
             }
         }
 
@@ -433,6 +489,7 @@ const Indicator = GObject.registerClass(
 
         destroy() {
             this._destroyed = true;
+            this._clearWanted();
             if (this._proxy) {
                 for (const id of this._proxyIds) {
                     this._proxy.disconnect(id);
