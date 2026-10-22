@@ -147,7 +147,7 @@ impl Ui for Service {
             return Ok(Response::new(rule));
         }
         let answer = self.prompt(&con, &settings).await;
-        let rule = match answer {
+        let mut rule = match answer {
             Some(rule) => rule,
             None => {
                 tracing::warn!(
@@ -158,6 +158,7 @@ impl Ui for Service {
                     .ok_or_else(|| Status::internal("cannot build a default rule"))?
             }
         };
+        rule::make_name_unique(&mut rule, &self.link.rules(), now_secs());
         self.link.remember(&rule);
         self.remember(key, &rule);
         Ok(Response::new(rule))
@@ -528,7 +529,9 @@ mod tests {
             })
             .await
             .unwrap();
-        update.await.unwrap().unwrap();
+        let outcome = update.await.unwrap();
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.updated, ["allow-always-list-curl"]);
         assert!(crate::checksum::find(&link.rules(), &con, now_secs()).is_empty());
     }
 }

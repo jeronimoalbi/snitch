@@ -1,6 +1,6 @@
 //! The connection prompt window, mirroring the Qt UI's `PromptDialog`.
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::path::Path;
 use std::rc::Rc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -11,7 +11,7 @@ use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use libadwaita as adw;
 
 use crate::checksum::{self, Mismatch};
-use crate::link::Updater;
+use crate::link::{Outcome, Updater};
 use crate::model::{self, Target};
 use crate::proto::{Connection, Rule};
 use crate::rule::{self, Action, Choice, DURATIONS};
@@ -29,6 +29,15 @@ pub struct Checks {
     pub updater: Option<Updater>,
 }
 
+/// What the prompt resolved to.
+#[derive(Debug, Default)]
+pub struct Answer {
+    /// The user's rule; `None` when it was cancelled or the selection is empty.
+    pub rule: Option<Rule>,
+    /// The countdown ran out (or popups are disabled), so the default applied.
+    pub timed_out: bool,
+}
+
 /// Shows the prompt for `con` and resolves to the user's rule.
 ///
 /// Resolves to `None` when `cancelled` turns true (the daemon stopped waiting)
@@ -40,14 +49,17 @@ pub async fn prompt(
     settings: Settings,
     checks: Checks,
     cancelled: impl Fn() -> bool + 'static,
-) -> Option<Rule> {
+) -> Answer {
     if settings.popups_disabled() {
-        return rule::default_rule(&con, &settings, None, now_secs());
+        return Answer {
+            rule: rule::default_rule(&con, &settings, None, now_secs()),
+            timed_out: true,
+        };
     }
     let (result, answer) = async_channel::bounded(1);
     let dialog = Dialog::new(app, con, settings, checks, result);
     dialog.start(cancelled);
-    answer.recv().await.ok().flatten()
+    answer.recv().await.unwrap_or_default()
 }
 
 fn now_secs() -> i64 {
@@ -87,6 +99,47 @@ fn padded_box(spacing: i32) -> gtk::Box {
     b.set_margin_start(MARGIN);
     b.set_margin_end(MARGIN);
     b
+}
+
+/// Widgets of the checksums page that the update handlers touch.
+#[derive(Clone)]
+struct ChecksumsUi {
+    names: gtk::DropDown,
+    status: gtk::Label,
+    buttons: gtk::Box,
+    update: gtk::Button,
+    update_all: gtk::Button,
+}
+
+/// Every name in a [`name_dropdown`].
+fn list_names(dd: &gtk::DropDown) -> Vec<String> {
+    let Some(model) = dd.model() else {
+        return Vec::new();
+    };
+    (0..model.n_items())
+        .filter_map(|i| model.item(i).and_downcast::<gtk::StringObject>())
+        .map(|s| s.string().to_string())
+        .collect()
+}
+
+/// The selected name of a [`name_dropdown`].
+fn selected_name(dd: &gtk::DropDown) -> Option<String> {
+    dd.selected_item()
+        .and_downcast::<gtk::StringObject>()
+        .map(|s| s.string().to_string())
+}
+
+/// Removes `names` from a [`name_dropdown`].
+fn remove_names(dd: &gtk::DropDown, names: &[String]) {
+    let Some(list) = dd.model().and_downcast::<gtk::StringList>() else {
+        return;
+    };
+    for name in names {
+        let position = (0..list.n_items()).find(|&i| list.string(i).as_deref() == Some(name));
+        if let Some(position) = position {
+            list.remove(position);
+        }
+    }
 }
 
 /// A dropdown of `names` whose entries are cut short instead of widening the window.
@@ -151,7 +204,10 @@ struct Dialog {
     timeout: u32,
     counting: Cell<bool>,
     done: Cell<bool>,
-    result: async_channel::Sender<Option<Rule>>,
+    result: async_channel::Sender<Answer>,
+    timed_out: Cell<bool>,
+    /// The red warning on the main page, hidden once every rule is updated.
+    warning: RefCell<Option<gtk::Label>>,
 }
 
 impl Dialog {
@@ -160,7 +216,7 @@ impl Dialog {
         con: Connection,
         settings: Settings,
         checks: Checks,
-        result: async_channel::Sender<Option<Rule>>,
+        result: async_channel::Sender<Answer>,
     ) -> Rc<Self> {
         let info = desktop_info(&con.process_path);
         let app_name = view::app_name(info.as_ref().map(|i| i.display_name()).as_deref(), &con);
@@ -244,6 +300,8 @@ impl Dialog {
             counting: Cell::new(!settings.advanced),
             done: Cell::new(false),
             result,
+            timed_out: Cell::new(false),
+            warning: RefCell::new(None),
         });
         dialog.build_ui(info.as_ref(), &app_name, &user);
         dialog.advanced.set_active(settings.advanced);
@@ -434,6 +492,7 @@ impl Dialog {
             d.stack.set_visible_child_name("checksums");
             gtk::glib::Propagation::Stop
         });
+        *self.warning.borrow_mut() = Some(warning.clone());
         Some(warning)
     }
 
@@ -446,32 +505,31 @@ impl Dialog {
         note.set_selectable(true);
         note.set_wrap_mode(gtk::pango::WrapMode::Char);
 
-        let names = name_dropdown(&self.checks.mismatch.rule_names);
-        let status = label("");
-        let update = gtk::Button::with_label("Update rule");
-        let update_all = gtk::Button::with_label("Update all");
         let back = gtk::Button::with_label("Back");
-        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
-        buttons.set_halign(gtk::Align::End);
-        for b in [&update, &update_all, &back] {
-            buttons.append(b);
+        let ui = ChecksumsUi {
+            names: name_dropdown(&self.checks.mismatch.rule_names),
+            status: label(""),
+            buttons: gtk::Box::new(gtk::Orientation::Horizontal, 8),
+            update: gtk::Button::with_label("Update rule"),
+            update_all: gtk::Button::with_label("Update all"),
+        };
+        ui.buttons.set_halign(gtk::Align::End);
+        for b in [&ui.update, &ui.update_all, &back] {
+            ui.buttons.append(b);
         }
 
-        // `update_all` asks for every rule in the list, `update` for the selected one.
-        for (button, all) in [(&update, false), (&update_all, true)] {
-            let (d, names, status, buttons) =
-                (self.clone(), names.clone(), status.clone(), buttons.clone());
+        // `update_all` asks for every rule still listed, `update` for the selected one.
+        for (button, all) in [(&ui.update, false), (&ui.update_all, true)] {
+            let (d, ui) = (self.clone(), ui.clone());
             button.connect_clicked(move |_| {
-                let selected = names
-                    .selected_item()
-                    .and_downcast::<gtk::StringObject>()
-                    .map(|s| s.string().to_string());
-                let targets = match (all, selected) {
-                    (true, _) => d.checks.mismatch.rule_names.clone(),
-                    (false, Some(name)) => vec![name],
-                    (false, None) => return,
+                let targets = if all {
+                    list_names(&ui.names)
+                } else {
+                    selected_name(&ui.names).into_iter().collect()
                 };
-                d.update_rules(targets, &status, &buttons);
+                if !targets.is_empty() {
+                    d.update_rules(&ui, targets);
+                }
             });
         }
         let d = self.clone();
@@ -479,38 +537,58 @@ impl Dialog {
 
         let page = padded_box(12);
         page.append(&note);
-        page.append(&names);
-        page.append(&status);
-        page.append(&buttons);
+        page.append(&ui.names);
+        page.append(&ui.status);
+        page.append(&ui.buttons);
         page
     }
 
-    /// Pins the program's checksum in `names` and reports the outcome in `status`.
-    fn update_rules(self: &Rc<Self>, names: Vec<String>, status: &gtk::Label, buttons: &gtk::Box) {
+    /// Pins the program's checksum in `names` and reports the outcome on the page.
+    ///
+    /// Updated rules leave the list, so they aren't sent again; when none are
+    /// left the warning goes away too.
+    fn update_rules(self: &Rc<Self>, ui: &ChecksumsUi, names: Vec<String>) {
         let md5 = view::md5(&self.con).to_string();
         let updater = self.checks.updater.clone();
-        let (status, buttons) = (status.clone(), buttons.clone());
-        status.remove_css_class("error");
-        status.remove_css_class("success");
-        status.set_text("Updating...");
-        buttons.set_sensitive(false);
+        let (d, ui) = (self.clone(), ui.clone());
+        ui.status.remove_css_class("error");
+        ui.status.remove_css_class("success");
+        ui.status.set_text("Updating...");
+        ui.buttons.set_sensitive(false);
         gtk::glib::spawn_future_local(async move {
             let outcome = match updater {
                 Some(updater) => updater.update_checksums(names, md5).await,
                 // Demo mode has no daemon: pretend it worked.
-                None => Ok(()),
+                None => Outcome {
+                    updated: names,
+                    error: None,
+                },
             };
-            match outcome {
-                Ok(()) => {
-                    status.add_css_class("success");
-                    status.set_text("\u{2714} Rule updated.");
+            remove_names(&ui.names, &outcome.updated);
+            match &outcome.error {
+                None => {
+                    ui.status.add_css_class("success");
+                    ui.status.set_text(&match outcome.updated.len() {
+                        1 => "\u{2714} Rule updated.".to_string(),
+                        n => format!("\u{2714} {n} rules updated."),
+                    });
                 }
-                Err(err) => {
-                    status.add_css_class("error");
-                    status.set_text(&format!("\u{2718} {}", view::printable(&err)));
+                Some(err) => {
+                    ui.status.add_css_class("error");
+                    ui.status
+                        .set_text(&format!("\u{2718} {}", view::printable(err)));
                 }
             }
-            buttons.set_sensitive(true);
+            ui.buttons.set_sensitive(true);
+            if list_names(&ui.names).is_empty() {
+                for b in [&ui.update, &ui.update_all] {
+                    b.set_sensitive(false);
+                }
+                ui.names.set_sensitive(false);
+                if let Some(warning) = d.warning.borrow().as_ref() {
+                    warning.set_visible(false);
+                }
+            }
         });
     }
 
@@ -626,6 +704,7 @@ impl Dialog {
                 let left = d.remaining.get().saturating_sub(1);
                 d.remaining.set(left);
                 if left == 0 {
+                    d.timed_out.set(true);
                     d.send_rule(d.default_action);
                     return gtk::glib::ControlFlow::Break;
                 }
@@ -666,7 +745,10 @@ impl Dialog {
             return;
         }
         // The channel has room for exactly this one answer.
-        let _ = self.result.try_send(rule);
+        let _ = self.result.try_send(Answer {
+            rule,
+            timed_out: self.timed_out.get(),
+        });
         self.window.destroy();
     }
 }

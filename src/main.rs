@@ -125,7 +125,10 @@ fn run_demo(app: &adw::Application, scenario: &str, settings_path: &std::path::P
             mismatch: demo::mismatch(&scenario),
             updater: None,
         };
-        match dialog::prompt(&app, con, settings, checks, || false).await {
+        match dialog::prompt(&app, con, settings, checks, || false)
+            .await
+            .rule
+        {
             Some(rule) => println!(
                 "{}",
                 serde_json::to_string_pretty(&rule::to_json(&rule)).unwrap_or_default()
@@ -197,13 +200,66 @@ fn run_daemon(app: &adw::Application, socket: Option<String>, settings_path: Pat
             let gone = reply.clone();
             let cancelled = move || gone.borrow().as_ref().is_none_or(|r| r.is_closed());
             let checks = dialog::Checks { mismatch, updater };
-            let rule = dialog::prompt(&prompt_app, con, settings, checks, cancelled).await;
+            let asked = con.clone();
+            let answer = dialog::prompt(&prompt_app, con, settings, checks, cancelled).await;
+            if answer.timed_out
+                && let Some(rule) = &answer.rule
+            {
+                let (title, body) = view::missed_popup(&asked, rule);
+                glib::spawn_future_local(notify_desktop(title, body));
+            }
             if let Some(reply) = reply.borrow_mut().take() {
                 // The daemon may have given up meanwhile; nothing to do then.
-                let _ = reply.send(rule);
+                let _ = reply.send(answer.rule);
             }
         }
     });
+}
+
+/// Shows a desktop notification through `org.freedesktop.Notifications`, the
+/// interface GNOME, KDE, dunst and mako all implement. It needs no desktop
+/// file, unlike notifications sent through the application ID.
+///
+/// The server decides how long it stays up, and applies its own Do Not Disturb
+/// and notification settings, such as GNOME's.
+async fn notify_desktop(title: String, body: String) {
+    use std::collections::HashMap;
+
+    use glib::prelude::ToVariant;
+
+    let urgency_normal: u8 = 1;
+    let hints = HashMap::from([("urgency".to_string(), urgency_normal.to_variant())]);
+    // -1 means "the server's default expiry".
+    let expire_ms: i32 = -1;
+    let params = (
+        "OpenSnitch",
+        0u32,
+        "dialog-information",
+        title,
+        body,
+        Vec::<String>::new(),
+        hints,
+        expire_ms,
+    )
+        .to_variant();
+
+    let sent = async {
+        let bus = gtk4::gio::bus_get_future(gtk4::gio::BusType::Session).await?;
+        bus.call_future(
+            Some("org.freedesktop.Notifications"),
+            "/org/freedesktop/Notifications",
+            "org.freedesktop.Notifications",
+            "Notify",
+            Some(&params),
+            None,
+            gtk4::gio::DBusCallFlags::NONE,
+            5_000,
+        )
+        .await
+    };
+    if let Err(err) = sent.await {
+        tracing::warn!("cannot show the notification: {err}");
+    }
 }
 
 #[cfg(test)]

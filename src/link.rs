@@ -21,6 +21,15 @@ const REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 type Outbox = mpsc::Sender<Result<Notification, Status>>;
 type Verdict = Result<(), String>;
 
+/// Which rules an update changed, and why it stopped early (if it did).
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Outcome {
+    /// Rules the daemon confirmed.
+    pub updated: Vec<String>,
+    /// The failure that ended the update; the remaining rules were not tried.
+    pub error: Option<String>,
+}
+
 /// Rules known to the daemon and the channel to send it notifications.
 #[derive(Default)]
 pub struct Link {
@@ -116,17 +125,22 @@ impl Link {
     }
 
     /// Pins `md5` in the named rules. Stops at the first failure.
-    async fn update_checksums(&self, names: &[String], md5: &str) -> Verdict {
+    async fn update_checksums(&self, names: &[String], md5: &str) -> Outcome {
+        let mut outcome = Outcome::default();
         for name in names {
-            let rule = lock(&self.rules)
-                .get(name)
-                .cloned()
-                .ok_or_else(|| format!("rule not found by name ({name})"))?;
-            self.change_rule(checksum::with_checksum(&rule, md5))
-                .await
-                .map_err(|e| format!("rule not updated ({name}): {e}"))?;
+            let Some(rule) = lock(&self.rules).get(name).cloned() else {
+                outcome.error = Some(format!("rule not found by name ({name})"));
+                break;
+            };
+            match self.change_rule(checksum::with_checksum(&rule, md5)).await {
+                Ok(()) => outcome.updated.push(name.clone()),
+                Err(err) => {
+                    outcome.error = Some(format!("rule not updated ({name}): {err}"));
+                    break;
+                }
+            }
         }
-        Ok(())
+        outcome
     }
 }
 
@@ -147,12 +161,15 @@ impl Updater {
     }
 
     /// Pins `md5` in the rules called `names`.
-    pub async fn update_checksums(&self, names: Vec<String>, md5: String) -> Result<(), String> {
+    pub async fn update_checksums(&self, names: Vec<String>, md5: String) -> Outcome {
         let link = self.link.clone();
-        self.runtime
-            .spawn(async move { link.update_checksums(&names, &md5).await })
-            .await
-            .map_err(|e| e.to_string())?
+        let task = self
+            .runtime
+            .spawn(async move { link.update_checksums(&names, &md5).await });
+        task.await.unwrap_or_else(|err| Outcome {
+            updated: Vec::new(),
+            error: Some(err.to_string()),
+        })
     }
 }
 
@@ -212,7 +229,9 @@ mod tests {
         let mut seen = daemon(&link, NotificationReplyCode::Ok);
 
         let names = vec!["a".to_string(), "b".to_string()];
-        link.update_checksums(&names, "new").await.unwrap();
+        let outcome = link.update_checksums(&names, "new").await;
+        assert_eq!(outcome.error, None);
+        assert_eq!(outcome.updated, ["a", "b"]);
 
         let first = seen.recv().await.unwrap();
         assert_eq!(first.r#type, Action::ChangeRule as i32);
@@ -234,15 +253,25 @@ mod tests {
         link.replace_rules(vec![rule("a", "old")]);
         let _seen = daemon(&link, NotificationReplyCode::Error);
 
-        let err = link
-            .update_checksums(&["a".to_string()], "new")
-            .await
-            .unwrap_err();
+        let outcome = link.update_checksums(&["a".to_string()], "new").await;
+        let err = outcome.error.unwrap();
         assert!(err.contains("boom"), "{err}");
+        assert!(outcome.updated.is_empty());
         assert_eq!(
             link.rules()[0].operator.as_ref().unwrap().list[1].data,
             "old"
         );
+    }
+
+    #[tokio::test]
+    async fn a_failure_keeps_the_rules_updated_before_it() {
+        let link = Arc::new(Link::default());
+        link.replace_rules(vec![rule("a", "old"), rule("c", "old")]);
+        let _seen = daemon(&link, NotificationReplyCode::Ok);
+        let names = vec!["a".to_string(), "missing".to_string(), "c".to_string()];
+        let outcome = link.update_checksums(&names, "new").await;
+        assert_eq!(outcome.updated, ["a"]);
+        assert!(outcome.error.unwrap().contains("missing"));
     }
 
     #[tokio::test]
@@ -252,12 +281,14 @@ mod tests {
         let err = link
             .update_checksums(&["a".to_string()], "new")
             .await
-            .unwrap_err();
+            .error
+            .unwrap();
         assert!(err.contains("not connected"), "{err}");
         let err = link
             .update_checksums(&["zzz".to_string()], "new")
             .await
-            .unwrap_err();
+            .error
+            .unwrap();
         assert!(err.contains("not found"), "{err}");
     }
 

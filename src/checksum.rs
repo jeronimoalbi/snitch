@@ -23,20 +23,12 @@ impl Mismatch {
     }
 }
 
-/// Seconds a time-limited duration (`30s`, `5m`, `1h`...) lasts.
-fn duration_secs(duration: &str) -> Option<i64> {
-    let (number, unit) = [("s", 1), ("m", 60), ("h", 3600)]
-        .into_iter()
-        .find_map(|(suffix, unit)| duration.strip_suffix(suffix).map(|n| (n, unit)))?;
-    number.parse::<i64>().ok()?.checked_mul(unit)
-}
-
 /// True for rules that can still apply: enabled, not one-shot, not expired.
 fn is_active(rule: &Rule, now: i64) -> bool {
     if !rule.enabled || rule.duration == "once" {
         return false;
     }
-    duration_secs(&rule.duration).is_none_or(|secs| rule.created + secs > now)
+    !crate::rule::is_expired(rule, now)
 }
 
 fn conditions(rule: &Rule) -> &[Operator] {
@@ -212,16 +204,5 @@ mod tests {
         let text = note(&c, &find(&rules, &c, 2_000));
         assert!(text.contains("Current process (42):\nnew"));
         assert!(text.ends_with("old1\nold2"));
-    }
-
-    #[test]
-    fn parses_durations() {
-        assert_eq!(duration_secs("30s"), Some(30));
-        assert_eq!(duration_secs("5m"), Some(300));
-        assert_eq!(duration_secs("12h"), Some(43_200));
-        assert_eq!(duration_secs("5\u{e9}"), None);
-        assert_eq!(duration_secs("until restart"), None);
-        assert_eq!(duration_secs("always"), None);
-        assert_eq!(duration_secs(""), None);
     }
 }

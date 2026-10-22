@@ -4,7 +4,7 @@
 //! ends up in Pango markup goes through [`escape_markup`].
 
 use crate::model::command_line;
-use crate::proto::Connection;
+use crate::proto::{Connection, Rule};
 
 /// Escapes `text` for use inside Pango markup.
 pub fn escape_markup(text: &str) -> String {
@@ -42,6 +42,48 @@ pub fn printable_lines(text: &str) -> String {
     text.chars()
         .filter(|c| *c == '\n' || !c.is_control())
         .collect()
+}
+
+/// Escapes the characters desktop notification bodies treat as markup.
+fn escape_body(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
+/// Title and body of the notification shown when a prompt timed out and the
+/// default rule was applied. The values come from the connection, so they are
+/// escaped for the notification body.
+pub fn missed_popup(con: &Connection, rule: &Rule) -> (String, String) {
+    let verb = match rule.action.as_str() {
+        "allow" => "allowed",
+        "reject" => "rejected",
+        _ => "dropped",
+    };
+    let program = match con.process_path.rsplit('/').next() {
+        Some(name) if !name.is_empty() => printable(name),
+        _ => "A program".to_string(),
+    };
+    let host = if con.dst_host.is_empty() {
+        &con.dst_ip
+    } else {
+        &con.dst_host
+    };
+    let destination = match con.dst_port {
+        0 => printable(host),
+        port => format!("{}:{port}", printable(host)),
+    };
+    let protocol = match con.protocol.as_str() {
+        "" => String::new(),
+        p => format!(" ({})", printable(&p.to_uppercase())),
+    };
+    let body = format!(
+        "{} to {}{}\nNobody answered in time, so the default action was applied.",
+        escape_body(&program),
+        escape_body(&destination),
+        escape_body(&protocol),
+    );
+    (format!("Connection {verb}"), body)
 }
 
 /// Application name: desktop entry name, else the binary name.
@@ -245,6 +287,58 @@ mod tests {
         assert_eq!(app_name(Some("Curl App"), &c), "Curl App");
         c.process_path.clear();
         assert_eq!(app_name(None, &c), "Outgoing connection");
+    }
+
+    fn applied(action: &str) -> Rule {
+        Rule {
+            action: action.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn missed_popup_says_what_happened() {
+        let (title, body) = missed_popup(&con(), &applied("deny"));
+        assert_eq!(title, "Connection dropped");
+        assert_eq!(
+            body,
+            "curl to example.com:443 (TCP)\nNobody answered in time, so the default action was applied."
+        );
+    }
+
+    #[test]
+    fn missed_popup_title_follows_the_action() {
+        assert_eq!(
+            missed_popup(&con(), &applied("allow")).0,
+            "Connection allowed"
+        );
+        assert_eq!(
+            missed_popup(&con(), &applied("reject")).0,
+            "Connection rejected"
+        );
+    }
+
+    #[test]
+    fn missed_popup_copes_with_missing_data() {
+        let mut c = con();
+        c.process_path.clear();
+        c.dst_host.clear();
+        c.dst_port = 0;
+        c.protocol.clear();
+        let (_, body) = missed_popup(&c, &applied("deny"));
+        assert!(body.starts_with("A program to 1.2.3.4\n"), "{body}");
+    }
+
+    #[test]
+    fn missed_popup_escapes_connection_data() {
+        let mut c = con();
+        c.process_path = "/tmp/<i>evil&".into();
+        c.dst_host = "<a href=\"x\">".into();
+        let (_, body) = missed_popup(&c, &applied("deny"));
+        assert!(
+            body.starts_with("&lt;i&gt;evil&amp; to &lt;a href=\"x\"&gt;:443 (TCP)\n"),
+            "{body}"
+        );
     }
 
     #[test]

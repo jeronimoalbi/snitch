@@ -18,6 +18,19 @@ pub const DURATIONS: [(&str, &str); 9] = [
     ("forever", "always"),
 ];
 
+/// Seconds a time-limited duration (`30s`, `5m`, `1h`...) lasts.
+pub fn duration_secs(duration: &str) -> Option<i64> {
+    let (number, unit) = [("s", 1), ("m", 60), ("h", 3600)]
+        .into_iter()
+        .find_map(|(suffix, unit)| duration.strip_suffix(suffix).map(|n| (n, unit)))?;
+    number.parse::<i64>().ok()?.checked_mul(unit)
+}
+
+/// True when a time-limited rule has run out.
+pub fn is_expired(rule: &Rule, now: i64) -> bool {
+    duration_secs(&rule.duration).is_some_and(|secs| rule.created.saturating_add(secs) <= now)
+}
+
 /// What to do with the connection.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
@@ -203,6 +216,30 @@ pub fn build_rule(con: &Connection, choice: &Choice, created: i64) -> Option<Rul
     })
 }
 
+/// Gives `rule` a name no known rule uses, like the Qt UI: `-0` to `-99` is
+/// appended while the name is taken. A rule identical to the one holding the
+/// name keeps it, since the daemon then just replaces it with the same content.
+/// Expired rules don't hold their name any more.
+pub fn make_name_unique(rule: &mut Rule, known: &[Rule], now: i64) {
+    let holder = |name: &str| known.iter().find(|r| r.name == name && !is_expired(r, now));
+    match holder(&rule.name) {
+        None => return,
+        Some(r)
+            if (&r.action, &r.duration, &r.operator)
+                == (&rule.action, &rule.duration, &rule.operator) =>
+        {
+            return;
+        }
+        Some(_) => {}
+    }
+    let free = (0..100)
+        .map(|i| format!("{}-{i}", rule.name))
+        .find(|name| holder(name).is_none());
+    if let Some(name) = free {
+        rule.name = name;
+    }
+}
+
 /// The rule the dialog would send untouched: the saved default action, duration
 /// (or `duration_idx`) and target, with the saved advanced checkboxes.
 ///
@@ -380,6 +417,77 @@ mod tests {
         c.process_path.clear();
         let t = model::what_targets(&c);
         assert!(build_rule(&c, &choice(&t, 0), 1).is_none());
+    }
+
+    fn named(name: &str, action: &str) -> Rule {
+        Rule {
+            name: name.into(),
+            action: action.into(),
+            duration: "always".into(),
+            operator: Some(Operator {
+                r#type: "simple".into(),
+                operand: "process.path".into(),
+                data: "/usr/bin/curl".into(),
+                ..Default::default()
+            }),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn free_names_are_kept() {
+        let mut rule = named("allow-always-simple-curl", "allow");
+        make_name_unique(&mut rule, &[named("other", "allow")], 100);
+        assert_eq!(rule.name, "allow-always-simple-curl");
+    }
+
+    #[test]
+    fn identical_rule_keeps_its_name() {
+        let mut rule = named("a", "allow");
+        make_name_unique(&mut rule, &[named("a", "allow")], 100);
+        assert_eq!(rule.name, "a");
+    }
+
+    #[test]
+    fn taken_names_get_the_first_free_suffix() {
+        let known = [
+            named("a", "deny"),
+            named("a-0", "deny"),
+            named("a-1", "deny"),
+        ];
+        let mut rule = named("a", "allow");
+        make_name_unique(&mut rule, &known, 100);
+        assert_eq!(rule.name, "a-2");
+    }
+
+    #[test]
+    fn expired_rules_release_their_name() {
+        let mut old = named("a", "deny");
+        old.duration = "5m".into();
+        old.created = 0;
+        let mut rule = named("a", "allow");
+        make_name_unique(&mut rule, &[old], 1_000);
+        assert_eq!(rule.name, "a");
+    }
+
+    #[test]
+    fn gives_up_after_one_hundred_suffixes() {
+        let mut known = vec![named("a", "deny")];
+        known.extend((0..100).map(|i| named(&format!("a-{i}"), "deny")));
+        let mut rule = named("a", "allow");
+        make_name_unique(&mut rule, &known, 100);
+        assert_eq!(rule.name, "a");
+    }
+
+    #[test]
+    fn parses_durations() {
+        assert_eq!(duration_secs("30s"), Some(30));
+        assert_eq!(duration_secs("5m"), Some(300));
+        assert_eq!(duration_secs("12h"), Some(43_200));
+        assert_eq!(duration_secs("5\u{e9}"), None);
+        assert_eq!(duration_secs("until restart"), None);
+        assert_eq!(duration_secs("always"), None);
+        assert_eq!(duration_secs(""), None);
     }
 
     #[test]
