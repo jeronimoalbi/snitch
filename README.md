@@ -43,20 +43,6 @@ snitch --demo-scenario appimage # preview a specific scenario
 | `unknown`  | A process the daemon could not identify      |
 | `badchecksum` | A program whose checksum differs from saved rules (warning and update page) |
 
-## Checksum warning
-
-When a saved rule pins a program's MD5 and the running binary has a different one, the dialog shows a red **WARNING, bad checksum** line. Its **More info** link opens a page that shows the current and expected checksums and lets you pin the new one in the rules that disagree.
-
-| Button        | Effect                                           |
-|---------------|--------------------------------------------------|
-| Update rule   | Updates the rule selected in the list            |
-| Update all    | Updates every listed rule                        |
-
-- Requires `"Rules": {"EnableChecksums": true}` in `/etc/opensnitchd/default-config.json`; without it the daemon sends no checksums and nothing is compared.
-- Only list rules that combine the program path and a `process.hash.md5` condition are checked, which is what the "Checksum" advanced option creates.
-- Snitch learns the saved rules from the daemon when it connects (the rule files are readable only by root). If you edit rules while it runs, restart `snitch` to refresh them.
-- Updates are sent to the daemon as a rule change, and it saves them to its rule files.
-
 ## Install
 
 ### Arch Linux
@@ -119,3 +105,17 @@ pkill opensnitch-ui                                    # otherwise
 |------------------------------|------------------------|-----------------------------------|
 | Hyprland, Sway, KDE (Wayland)| Honoured               | Overlay layer, anchored to corner |
 | GNOME (Wayland), X11         | Ignored                | Normal window, placed by compositor |
+
+## Checksum warning
+
+When a saved rule pins a program's MD5 and the running binary has a different one, the dialog shows a red **WARNING, bad checksum** line. Its **More info** link opens a page that shows the current and expected checksums and lets you pin the new one in the rules that disagree.
+
+| Button        | Effect                                           |
+|---------------|--------------------------------------------------|
+| Update rule   | Updates the rule selected in the list            |
+| Update all    | Updates every listed rule                        |
+
+- Requires `"Rules": {"EnableChecksums": true}` in `/etc/opensnitchd/default-config.json`; without it the daemon sends no checksums and nothing is compared.
+- Only list rules that combine the program path and a `process.hash.md5` condition are checked, which is what the "Checksum" advanced option creates.
+- Snitch learns the saved rules from the daemon when it connects (the rule files are readable only by root). If you edit rules while it runs, restart `snitch` to refresh them.
+- Updates are sent to the daemon as a rule change, and it saves them to its rule files.
