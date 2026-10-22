@@ -6,6 +6,7 @@
 // to choose whether snitch starts on login. Turning the firewall off needs
 // authorisation, which snitch asks polkit for.
 
+import Clutter from 'gi://Clutter';
 import Gio from 'gi://Gio';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
@@ -15,6 +16,8 @@ import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
+
+import { loadSettings, saveSetting } from './settings.js';
 
 Gio._promisify(Gio.DBusConnection.prototype, 'call', 'call_finish');
 
@@ -82,6 +85,89 @@ const STATES = {
     },
 };
 
+// The choices of the prompt options. The values are what the OpenSnitch
+// settings file stores: an index for the first three, seconds for the timeout.
+const ACTIONS = [
+    { value: 0, label: 'Deny' },
+    { value: 1, label: 'Allow' },
+    { value: 2, label: 'Reject' },
+];
+const DURATIONS = ['once', '30 seconds', '5 minutes', '15 minutes', '30 minutes',
+    '1 hour', '12 hours', 'until reboot', 'forever']
+    .map((label, value) => ({ value, label }));
+const TARGETS = ['This executable', 'This command line', 'Destination port',
+    'Destination IP', 'This user', 'This process']
+    .map((label, value) => ({ value, label }));
+const TIMEOUTS = [5, 10, 15, 20, 30, 45, 60, 120]
+    .map(value => ({ value, label: `${value} seconds` }));
+
+// The advanced options the prompt can start with checked.
+const PROMPT_SWITCHES = [
+    ['advanced', 'Open the advanced view'],
+    ['dstIp', 'Check destination IP'],
+    ['dstPort', 'Check destination port'],
+    ['uid', 'Check user ID'],
+    ['checksum', 'Check checksum'],
+];
+
+// A menu row to pick one of a few values with the arrows on either side.
+const Stepper = GObject.registerClass(
+    class Stepper extends PopupMenu.PopupBaseMenuItem {
+        _init(title, options, onChange) {
+            super._init({ activate: false });
+            this._options = options;
+            this._onChange = onChange;
+            this._selected = 0;
+
+            this.add_child(new St.Label({
+                text: title,
+                x_expand: true,
+                y_align: Clutter.ActorAlign.CENTER,
+            }));
+            this._value = new St.Label({
+                y_align: Clutter.ActorAlign.CENTER,
+                style: 'min-width: 8em; text-align: center;',
+            });
+            this.add_child(this._button('go-previous-symbolic', -1));
+            this.add_child(this._value);
+            this.add_child(this._button('go-next-symbolic', 1));
+            this._show();
+        }
+
+        _button(icon, step) {
+            const button = new St.Button({
+                style_class: 'button',
+                can_focus: true,
+                child: new St.Icon({ icon_name: icon, style_class: 'popup-menu-icon' }),
+            });
+            button.connect('clicked', () => {
+                const count = this._options.length;
+                this._selected = (this._selected + step + count) % count;
+                this._show();
+                this._onChange(this._options[this._selected].value);
+            });
+            return button;
+        }
+
+        _show() {
+            this._value.text = this._options[this._selected].label;
+        }
+
+        // Shows `value`. One that is not among the choices (the file can hold
+        // any number of seconds) is added, so it is shown as it is.
+        setValue(value) {
+            let index = this._options.findIndex(o => o.value === value);
+            if (index < 0) {
+                const label = value === 0 ? 'never ask' : `${value} seconds`;
+                this._options = [...this._options, { value, label }]
+                    .sort((a, b) => a.value - b.value);
+                index = this._options.findIndex(o => o.value === value);
+            }
+            this._selected = index;
+            this._show();
+        }
+    });
+
 const Indicator = GObject.registerClass(
     class Indicator extends PanelMenu.Button {
         _init() {
@@ -109,22 +195,95 @@ const Indicator = GObject.registerClass(
             this._login.connect('toggled', (_item, on) => this._setAutostart(on));
             this._loginNote = new PopupMenu.PopupMenuItem('', { reactive: false });
 
+            this._prompt = new PopupMenu.PopupSubMenuMenuItem('Prompt defaults');
+            this._steppers = {
+                action: new Stepper('Default action', ACTIONS,
+                    value => this._savePrompt('action', value)),
+                duration: new Stepper('Duration', DURATIONS,
+                    value => this._savePrompt('duration', value)),
+                target: new Stepper('Apply to', TARGETS,
+                    value => this._savePrompt('target', value)),
+                timeout: new Stepper('Time to answer', TIMEOUTS,
+                    value => this._savePrompt('timeout', value)),
+            };
+            this._switches = {};
+            for (const stepper of Object.values(this._steppers)) {
+                this._prompt.menu.addMenuItem(stepper);
+            }
+            this._prompt.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+            for (const [name, title] of PROMPT_SWITCHES) {
+                const item = new PopupMenu.PopupSwitchMenuItem(title, false);
+                item.connect('toggled', (_item, on) => this._savePrompt(name, on));
+                this._switches[name] = item;
+                this._prompt.menu.addMenuItem(item);
+            }
+            this._promptNote = new PopupMenu.PopupMenuItem('', { reactive: false });
+            this._prompt.menu.addMenuItem(this._promptNote);
+            this._saving = Promise.resolve();
+
             const menu = this.menu;
             menu.addMenuItem(this._status);
             menu.addMenuItem(this._firewall);
             menu.addMenuItem(this._start);
             menu.addMenuItem(this._login);
             menu.addMenuItem(this._loginNote);
-            // The unit can change outside the extension, so look again each time.
+            menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+            menu.addMenuItem(this._prompt);
+            // The unit and the settings file can change outside the extension
+            // (the Qt UI writes the file too), so look again each time.
             menu.connect('open-state-changed', (_menu, open) => {
                 if (open) {
                     this._readAutostart();
+                    this._readPrompt();
                 }
             });
 
             this._connectProxy();
             this._sync();
             this._readAutostart();
+            this._readPrompt();
+        }
+
+        async _readPrompt() {
+            let values = null;
+            try {
+                values = await loadSettings();
+            } catch (error) {
+                console.error(`snitch: cannot read the settings: ${error.message}`);
+            }
+            if (this._destroyed) {
+                return;
+            }
+            const editable = values !== null;
+            this._promptNote.label.text = editable
+                ? 'Applies to the next prompt'
+                : 'Cannot read the OpenSnitch settings';
+            for (const [name, stepper] of Object.entries(this._steppers)) {
+                stepper.setSensitive(editable);
+                if (editable) {
+                    stepper.setValue(values[name]);
+                }
+            }
+            for (const [name, item] of Object.entries(this._switches)) {
+                item.setSensitive(editable);
+                if (editable) {
+                    item.setToggleState(values[name]);
+                }
+            }
+        }
+
+        // Saves one option. Saves run one after the other, so quick clicks end
+        // with the last value in the file.
+        _savePrompt(name, value) {
+            this._saving = this._saving.then(async () => {
+                try {
+                    await saveSetting(name, value);
+                } catch (error) {
+                    Main.notifyError('Snitch', `Cannot save the setting: ${error.message}`);
+                    // Show what the file says, which undoes the change.
+                    await this._readPrompt();
+                }
+            });
         }
 
         _connectProxy() {

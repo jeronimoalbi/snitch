@@ -176,10 +176,6 @@ desktop notification saying what happened, for example **Connection dropped**:
 
 An optional [GNOME Shell extension](contrib/gnome-extension/README.md) puts an
 eye in the top bar that shows whether the firewall is on and turns it on or off.
-Its menu also switches snitch's start on login on and off. Snitch offers the
-firewall switch on the session D-Bus. Turning the firewall **off** asks
-for your password through polkit, because any program running as you could call
-it. Turning it on is open to all, and every change shows a notification.
 
 ### Logs
 

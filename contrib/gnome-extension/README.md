@@ -1,8 +1,8 @@
 # Snitch for GNOME Shell
 
 An eye in the top bar that shows whether OpenSnitch is asking about
-connections. A click opens a menu to turn it on or off and to choose whether
-snitch starts when you log in.
+connections. A click opens a menu to turn it on or off, to choose whether
+snitch starts when you log in and to change what the prompt starts with.
 
 | Icon        | Meaning                                                 |
 |-------------|---------------------------------------------------------|
@@ -17,6 +17,7 @@ snitch starts when you log in.
 |                       | password, see below)                            |
 | Start snitch now      | Only shown when snitch isn't running            |
 | Start snitch on login | Turns the autostart of snitch on or off         |
+| Prompt defaults       | Opens the prompt options, see below             |
 
 It is a small front end for the [snitch](../../README.md) prompt program, which
 must be running. The extension does not talk to the OpenSnitch daemon itself.
@@ -73,6 +74,41 @@ group can then turn your firewall off silently** (you would still see the
 notification afterwards). That is the same trust you give a program you run
 yourself, but it also covers a program that you did not mean to run, which is
 what OpenSnitch is there to catch. Leave the rule out unless you accept that.
+
+## Prompt defaults
+
+The same options as in the OpenSnitch preferences, so you don't have to open
+the Qt window. They are read from and saved to
+`~/.config/opensnitch/settings.conf`, the file the Qt UI uses.
+
+| Option                    | What it sets                                |
+|---------------------------|---------------------------------------------|
+| Default action            | Deny, allow or reject; also what is applied |
+|                           | when the time to answer runs out            |
+| Duration                  | How long the rule lasts, from once to       |
+|                           | forever                                     |
+| Apply to                  | What the rule matches: the executable, the  |
+|                           | command line, the port, the IP...           |
+| Time to answer            | Seconds before the default action is applied|
+| Open the advanced view    | Start with the advanced options showing     |
+| Check destination IP...   | Which advanced checks start ticked          |
+
+Use the arrows to change a choice. Each change is saved at once and applies to
+the next prompt; there is nothing to restart. Only these keys of the file are
+touched, in the `[global]` section. Everything else the Qt UI keeps there, such
+as window sizes, stays as it was.
+
+Some things to know:
+
+- The position of the prompt is not offered: GNOME doesn't let a program place
+  its own windows, so the setting has no effect here.
+- If you started snitch with `--settings`, the menu still edits the default
+  file.
+- The menu shows the file as it is each time it opens, so a change made in the
+  Qt UI shows up there.
+- "Time to answer" stepping never offers `0` (never ask, apply the default).
+  With a default action of allow that would silently allow everything. If the
+  file already says `0`, the menu shows it as it is.
 
 ## If the icon is crossed out
 
