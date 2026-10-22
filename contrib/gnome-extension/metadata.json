@@ -4,5 +4,5 @@
   "description": "An eye in the top bar that shows whether OpenSnitch is asking about connections, and turns it on or off. Needs the snitch prompt program running.",
   "shell-version": ["51"],
   "url": "https://github.com/jeronimoalbi/snitch",
-  "version-name": "0.1.0"
+  "version-name": "0.2.0"
 }

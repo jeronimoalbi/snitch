@@ -1,13 +1,22 @@
 # Snitch for GNOME Shell
 
 An eye in the top bar that shows whether OpenSnitch is asking about
-connections, and turns it on or off with a click.
+connections. A click opens a menu to turn it on or off and to choose whether
+snitch starts when you log in.
 
 | Icon        | Meaning                                                 |
 |-------------|---------------------------------------------------------|
 | Open eye    | The firewall is on and asks about new connections       |
 | Closed eye  | The firewall is paused: connections are not intercepted |
 | Crossed out | Snitch isn't running or the daemon isn't connected      |
+
+| Menu item             | What it does                                    |
+|-----------------------|-------------------------------------------------|
+| Status line           | Says what the icon means                        |
+| Firewall on           | Turns the firewall on or off (off asks for your |
+|                       | password, see below)                            |
+| Start snitch now      | Only shown when snitch isn't running            |
+| Start snitch on login | Turns the autostart of snitch on or off         |
 
 It is a small front end for the [snitch](../../README.md) prompt program, which
 must be running. The extension does not talk to the OpenSnitch daemon itself.
@@ -35,7 +44,7 @@ This is on purpose. Snitch offers its on/off switch to every program that runs
 as you, and a program you did not mean to run could use it to switch your
 firewall off without a sound. So:
 
-- **Turning it on** is one click. That can only make things stricter.
+- **Turning it on** needs no password. That can only make things stricter.
 - **Turning it off** asks for your password, through the same prompt GNOME shows
   for other system changes. Snitch asks
   [polkit](https://polkit.pages.freedesktop.org/polkit/), which checks who is
@@ -70,11 +79,6 @@ what OpenSnitch is there to catch. Leave the rule out unless you accept that.
 Snitch isn't running or the daemon isn't connected. Check
 `systemctl --user status snitch`, then see "If something goes wrong" in the main
 README. Errors from the extension are in `journalctl -f /usr/bin/gnome-shell`.
-
-## Releases
-
-The extension has its own version and its own tags, like
-`gnome-extension-v0.1.0`, separate from the snitch releases (`v0.9.0`).
 
 ## For developers
 
