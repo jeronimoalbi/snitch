@@ -6,6 +6,8 @@ A GTK4 / libadwaita replacement for the OpenSnitch Qt **connection prompt**.
 - Shows a dialog equivalent to the Qt one.
 - Follows the defaults saved by the Qt UI (`~/.config/opensnitch/settings.conf`, read-only).
 
+![snitch prompt dialog](docs/screenshots/dialog.png)
+
 > Only one UI can own the socket. Stop `opensnitch-ui` (and `opensnitch-zenity`) before starting `snitch`.
 
 ## Usage
@@ -114,6 +116,16 @@ pkill opensnitch-ui                                    # otherwise
 |------------------------------|------------------------|-----------------------------------|
 | Hyprland, Sway, KDE (Wayland)| Honoured               | Overlay layer, anchored to corner |
 | GNOME (Wayland), X11         | Ignored                | Normal window, placed by compositor |
+
+## Development
+
+`--screenshot` renders the demo dialog to a PNG and exits. It is how the image above was made, using default settings so it doesn't depend on anyone's preferences:
+
+```sh
+snitch --demo --demo-scenario curl --settings /nonexistent --screenshot docs/screenshots/dialog.png
+```
+
+It saves only the window content, without shadow or desktop, using the current GTK theme (light or dark).
 
 ## Scope
 
