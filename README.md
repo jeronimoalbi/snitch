@@ -41,33 +41,6 @@ snitch --demo-scenario appimage # preview a specific scenario
 | `unknown`  | A process the daemon could not identify      |
 | `badchecksum` | A program whose checksum differs from saved rules (warning and update page) |
 
-### Socket addresses
-
-The address must match `Server.Address` in `/etc/opensnitchd/default-config.json`.
-
-| Form                  | Example                  |
-|-----------------------|--------------------------|
-| Unix socket           | `unix:///tmp/osui.sock`  |
-| Abstract unix socket  | `unix-abstract:snitch`   |
-| TCP                   | `127.0.0.1:50051`        |
-
-## Settings honoured
-
-Read from the `[global]` section of the Qt UI settings:
-
-| Key                                        | Effect                                                                 |
-|--------------------------------------------|------------------------------------------------------------------------|
-| `default_action`                           | Default action (drop, allow, reject) and the one the countdown applies |
-| `default_duration`                         | Preselected duration                                                   |
-| `default_target`                           | Preselected "apply to" entry                                           |
-| `default_timeout`                          | Seconds before the default applies; `0` disables the popup            |
-| `default_popup_position`                   | Screen corner (needs a compositor with layer-shell, see below)         |
-| `default_popup_advanced`                   | Start with the advanced view open                                      |
-| `default_popup_advanced_dstip`, `_dstport`, `_uid`, `_checksum` | Pre-checked advanced options                        |
-| `server_address`                           | Address to listen on                                                   |
-
-The settings are re-read on every prompt, so changes made in the Qt preferences apply immediately.
-
 ## Checksum warning
 
 When a saved rule pins a program's MD5 and the running binary has a different one, the dialog shows a red **WARNING, bad checksum** line. Its **More info** link opens a page that shows the current and expected checksums and lets you pin the new one in the rules that disagree.
@@ -144,17 +117,3 @@ pkill opensnitch-ui                                    # otherwise
 |------------------------------|------------------------|-----------------------------------|
 | Hyprland, Sway, KDE (Wayland)| Honoured               | Overlay layer, anchored to corner |
 | GNOME (Wayland), X11         | Ignored                | Normal window, placed by compositor |
-
-## Development
-
-`--screenshot` renders the demo dialog to a PNG and exits. It is how the image above was made, using default settings so it doesn't depend on anyone's preferences:
-
-```sh
-snitch --demo --demo-scenario curl --settings /nonexistent --screenshot docs/screenshots/dialog.png
-```
-
-It saves only the window content, without shadow or desktop, using the current GTK theme (light or dark).
-
-## Scope
-
-Settings are read-only. The Qt prompt only ever saves its own window geometry, which has no meaning for a fixed-size window, so snitch never writes to the Qt settings file. Change defaults in the Qt preferences.
