@@ -29,6 +29,7 @@ use crate::proto::{
 };
 use crate::rule;
 use crate::settings::Settings;
+use crate::view;
 
 /// Error type used for startup failures.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -136,9 +137,12 @@ impl Ui for Service {
 
     async fn ask_rule(&self, request: Request<Connection>) -> Result<Response<Rule>, Status> {
         let con = request.into_inner();
+        let summary = view::connection_summary(&con);
+        tracing::info!("asked about {summary}");
         let settings = Settings::load(&self.settings_path);
         let key = dedup_key(&con);
         if let Some(rule) = self.cached(&key) {
+            tracing::debug!("reusing the answer just given for {summary}");
             return Ok(Response::new(rule));
         }
 
@@ -150,15 +154,18 @@ impl Ui for Service {
         let mut rule = match answer {
             Some(rule) => rule,
             None => {
-                tracing::warn!(
-                    "no answer for {}, applying the default action once",
-                    con.process_path
-                );
+                tracing::warn!("no answer for {summary}, applying the default action once");
                 rule::default_rule(&con, &settings, Some(0), now_secs())
                     .ok_or_else(|| Status::internal("cannot build a default rule"))?
             }
         };
         rule::make_name_unique(&mut rule, &self.link.rules(), now_secs());
+        tracing::info!(
+            "answered {} {} as {}",
+            rule.action,
+            rule.duration,
+            rule.name
+        );
         self.link.remember(&rule);
         self.remember(key, &rule);
         Ok(Response::new(rule))
@@ -208,6 +215,7 @@ impl Ui for Service {
                 link.handle_reply(reply);
             }
             link.detach(&outbox);
+            tracing::info!("the daemon closed its notification stream");
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(stream))))
     }

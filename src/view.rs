@@ -86,6 +86,31 @@ pub fn missed_popup(con: &Connection, rule: &Rule) -> (String, String) {
     (format!("Connection {verb}"), body)
 }
 
+/// One-line description of a connection for the logs: program, destination and
+/// protocol. Command-line arguments are left out on purpose, since they can
+/// hold secrets such as tokens in URLs.
+pub fn connection_summary(con: &Connection) -> String {
+    let program = if con.process_path.is_empty() {
+        "unknown program"
+    } else {
+        &con.process_path
+    };
+    let host = if con.dst_host.is_empty() {
+        &con.dst_ip
+    } else {
+        &con.dst_host
+    };
+    let destination = match con.dst_port {
+        0 => printable(host),
+        port => format!("{}:{port}", printable(host)),
+    };
+    format!(
+        "{} -> {destination} {}",
+        printable(program),
+        printable(&con.protocol)
+    )
+}
+
 /// Application name: desktop entry name, else the binary name.
 pub fn app_name(desktop_name: Option<&str>, con: &Connection) -> String {
     if let Some(name) = desktop_name.filter(|n| !n.is_empty()) {
@@ -278,6 +303,28 @@ mod tests {
         c.process_args.clear();
         assert_eq!(path_label("curl", &c).as_deref(), Some("/usr/bin/curl"));
         assert_eq!(args_label("curl", &c), None);
+    }
+
+    #[test]
+    fn summary_names_program_destination_and_protocol() {
+        let mut c = con();
+        assert_eq!(
+            connection_summary(&c),
+            "/usr/bin/curl -> example.com:443 tcp"
+        );
+        c.process_args = vec!["--token=secret".into()];
+        assert!(!connection_summary(&c).contains("secret"));
+        c.process_path.clear();
+        c.dst_host.clear();
+        c.dst_port = 0;
+        assert_eq!(connection_summary(&c), "unknown program -> 1.2.3.4 tcp");
+    }
+
+    #[test]
+    fn summary_cannot_forge_log_lines() {
+        let mut c = con();
+        c.process_path = "/tmp/x\nINFO answered allow always".into();
+        assert!(!connection_summary(&c).contains('\n'));
     }
 
     #[test]

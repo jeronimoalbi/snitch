@@ -202,6 +202,23 @@ fn run_daemon(app: &adw::Application, socket: Option<String>, settings_path: Pat
             let checks = dialog::Checks { mismatch, updater };
             let asked = con.clone();
             let answer = dialog::prompt(&prompt_app, con, settings, checks, cancelled).await;
+            let abandoned = reply.borrow().as_ref().is_none_or(|r| r.is_closed());
+            match (&answer.rule, answer.timed_out) {
+                (Some(rule), true) => tracing::info!(
+                    "no answer in time, applied the default: {} {}",
+                    rule.action,
+                    rule.duration
+                ),
+                (None, _) if abandoned => tracing::info!(
+                    "the daemon stopped waiting for {}",
+                    view::connection_summary(&asked)
+                ),
+                (None, _) => tracing::warn!(
+                    "no rule came out of the prompt for {}",
+                    view::connection_summary(&asked)
+                ),
+                (Some(_), false) => {}
+            }
             if answer.timed_out
                 && let Some(rule) = &answer.rule
             {

@@ -149,3 +149,21 @@ When the countdown runs out and the default action is applied, snitch shows a
 desktop notification saying what happened, for example **Connection dropped**:
 `curl to www.example.com:443 (TCP)`. It uses the standard
 `org.freedesktop.Notifications` interface.
+
+## Logs
+
+Snitch logs each question and answer, so you can see what happened:
+
+```
+asked about /usr/bin/curl -> example.com:443 tcp
+no answer in time, applied the default: reject always
+answered reject always as reject-always-simple-usr-bin-curl
+```
+
+As a service the output goes to the journal, which rotates it by itself:
+
+```sh
+journalctl --user -u snitch -f
+```
+
+Command-line arguments are never logged, since they can contain secrets.

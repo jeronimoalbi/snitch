@@ -133,8 +133,12 @@ impl Link {
                 break;
             };
             match self.change_rule(checksum::with_checksum(&rule, md5)).await {
-                Ok(()) => outcome.updated.push(name.clone()),
+                Ok(()) => {
+                    tracing::info!("pinned the new checksum in rule {name}");
+                    outcome.updated.push(name.clone());
+                }
                 Err(err) => {
+                    tracing::warn!("rule {name} not updated: {err}");
                     outcome.error = Some(format!("rule not updated ({name}): {err}"));
                     break;
                 }
