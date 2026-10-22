@@ -534,4 +534,92 @@ mod tests {
         assert_eq!(outcome.updated, ["allow-always-list-curl"]);
         assert!(crate::checksum::find(&link.rules(), &con, now_secs()).is_empty());
     }
+
+    /// Builds one HTTP/2 frame.
+    fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
+        let len = u32::try_from(payload.len()).unwrap();
+        let mut out = len.to_be_bytes()[1..].to_vec();
+        out.extend([kind, flags]);
+        out.extend(stream.to_be_bytes());
+        out.extend(payload);
+        out
+    }
+
+    /// An HPACK "literal without indexing" header with a new name.
+    fn literal(name: &str, value: &str) -> Vec<u8> {
+        let mut out = vec![0x00, u8::try_from(name.len()).unwrap()];
+        out.extend(name.as_bytes());
+        out.push(u8::try_from(value.len()).unwrap());
+        out.extend(value.as_bytes());
+        out
+    }
+
+    /// opensnitchd uses grpc-go 1.32, which sends the unix socket path as the
+    /// HTTP/2 `:authority`. That is not a valid authority and the HTTP/2 library
+    /// used to answer with PROTOCOL_ERROR, so no call from the daemon worked.
+    /// This sends the same request as raw bytes and expects a normal reply.
+    #[tokio::test]
+    async fn accepts_the_invalid_authority_sent_by_grpc_go() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let (tx, _rx) = async_channel::unbounded::<PromptRequest>();
+        let service = Service::new(tx, PathBuf::from("/nonexistent/settings.conf"));
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(UiServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+
+        // HEADERS: POST, http, /protocol.UI/Ping, the bad authority, gRPC type.
+        let mut headers = vec![0x83, 0x86];
+        headers.extend([0x04, 17]);
+        headers.extend(b"/protocol.UI/Ping");
+        headers.extend([0x01, 14]);
+        headers.extend(b"/tmp/osui.sock");
+        headers.extend(literal("content-type", "application/grpc"));
+        headers.extend(literal("te", "trailers"));
+        // DATA: a gRPC message holding PingRequest { id: 7 }.
+        let message = [0, 0, 0, 0, 2, 0x08, 0x07];
+
+        let mut request = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        request.extend(frame(0x4, 0, 0, &[])); // SETTINGS
+        request.extend(frame(0x1, 0x4, 1, &headers)); // HEADERS, END_HEADERS
+        request.extend(frame(0x0, 0x1, 1, &message)); // DATA, END_STREAM
+
+        let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
+        conn.write_all(&request).await.unwrap();
+
+        // Read frames until the reply arrives or the stream is reset.
+        let mut reply = Vec::new();
+        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut head = [0u8; 9];
+                conn.read_exact(&mut head).await.unwrap();
+                let len =
+                    usize::try_from(u32::from_be_bytes([0, head[0], head[1], head[2]])).unwrap();
+                let mut payload = vec![0u8; len];
+                conn.read_exact(&mut payload).await.unwrap();
+                match (
+                    head[3],
+                    u32::from_be_bytes([head[5], head[6], head[7], head[8]]),
+                ) {
+                    (0x3, 1) => return Err(format!("stream reset, code {payload:?}")),
+                    (0x7, _) => return Err(format!("connection closed (GOAWAY), {payload:?}")),
+                    (0x0, 1) => {
+                        reply.extend(payload);
+                        return Ok(());
+                    }
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .expect("no reply within 5 seconds");
+
+        assert_eq!(outcome, Ok(()));
+        assert_eq!(reply, [0, 0, 0, 0, 2, 0x08, 0x07], "PingReply with id 7");
+    }
 }

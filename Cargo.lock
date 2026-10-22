@@ -619,8 +619,7 @@ dependencies = [
 [[package]]
 name = "h2"
 version = "0.4.20"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7d29020232d6aa3fb1daca64c1127cf662cf97f254ae16c18c05b8ab635fc118"
+source = "git+https://github.com/jeronimoalbi/h2?branch=snitch-authority#5ef917efa82de539b91315bb413fb898f7b5ebd2"
 dependencies = [
  "atomic-waker",
  "bytes",
