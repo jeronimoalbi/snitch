@@ -127,7 +127,8 @@ const Stepper = GObject.registerClass(
             }));
             this._value = new St.Label({
                 y_align: Clutter.ActorAlign.CENTER,
-                style: 'min-width: 8em; text-align: center;',
+                // Wide enough for the longest choice ("This command line").
+                style: 'min-width: 14em; text-align: center;',
             });
             this.add_child(this._button('go-previous-symbolic', -1));
             this.add_child(this._value);
@@ -190,8 +191,9 @@ const Indicator = GObject.registerClass(
             this._status = new PopupMenu.PopupMenuItem('', { reactive: false });
             this._firewall = new PopupMenu.PopupSwitchMenuItem('Enable firewall', false);
             this._firewall.connect('toggled', (_item, on) => this._setFirewall(on));
-            this._running = new PopupMenu.PopupSwitchMenuItem('Snitch running', false);
-            this._running.connect('toggled', (_item, on) => this._setRunning(on));
+            this._running = new PopupMenu.PopupSwitchMenuItem('Stop snitch', false);
+            // On means stopped, so a running snitch shows the switch off.
+            this._running.connect('toggled', (_item, on) => this._setRunning(!on));
             // Whether snitch had the bus name at the last look; null until known.
             this._owned = null;
             // What a switch click asked for, shown until snitch catches up.
@@ -229,11 +231,14 @@ const Indicator = GObject.registerClass(
             this._promptPath = null;
 
             const menu = this.menu;
+            // The status line is the longest text; fixing the width keeps the menu
+            // from resizing as the state changes.
+            menu.box.style = 'min-width: 34em;';
             menu.addMenuItem(this._status);
             menu.addMenuItem(this._firewall);
-            menu.addMenuItem(this._running);
             menu.addMenuItem(this._login);
             menu.addMenuItem(this._loginNote);
+            menu.addMenuItem(this._running);
             menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
             menu.addMenuItem(this._prompt);
             // The unit and the settings file can change outside the extension
@@ -357,7 +362,7 @@ const Indicator = GObject.registerClass(
             if (this._wanted === owned) {
                 this._clearWanted();
             }
-            this._running.setToggleState(this._wanted ?? owned);
+            this._running.setToggleState(!(this._wanted ?? owned));
             this._running.setSensitive(proxy !== null && !this._busy);
             // The file can change when snitch (re)starts.
             if (this._settingsPath() !== this._promptPath) {
@@ -416,11 +421,11 @@ const Indicator = GObject.registerClass(
         // switch, systemctl, or a crash.
         _announceRunning(running) {
             if (running) {
-                Main.notify('Snitch started', 'OpenSnitch asks about new connections.');
+                Main.notify('Snitch started', 'Snitch asks about new connections');
             } else {
                 Main.notify('Snitch stopped',
-                    'Nothing asks about connections now. The OpenSnitch daemon ' +
-                    'applies its own default action.');
+                    'Snitch won\'t ask about connections, the OpenSnitch daemon ' +
+                    'applies its own default action now');
             }
         }
 

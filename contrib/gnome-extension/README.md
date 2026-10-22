@@ -15,7 +15,8 @@ snitch starts when you log in and to change what the prompt starts with.
 | Status line           | Says what the icon means                        |
 | Firewall on           | Turns the firewall on or off (off asks for your |
 |                       | password, see below)                            |
-| Snitch running        | Starts or stops snitch                          |
+| Stop snitch           | Off while snitch runs; on stops it, and turning |
+|                       | it off again starts it                          |
 | Start snitch on login | Turns the autostart of snitch on or off         |
 | Prompt defaults       | Opens the prompt options, see below             |
 
