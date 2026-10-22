@@ -6,7 +6,9 @@ Snitch listens on the same gRPC socket as `opensnitch-ui` and asks you what to d
 
 It also uses the defaults saved by the Qt UI (`~/.config/opensnitch/settings.conf`, read-only).
 
-![snitch prompt dialog](docs/screenshots/dialog.png)
+<p align="center">
+  <img src="docs/screenshots/dialog.png" alt="snitch prompt dialog" width="70%">
+</p>
 
 ## Usage
 
