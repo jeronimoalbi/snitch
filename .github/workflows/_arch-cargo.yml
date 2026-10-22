@@ -1,0 +1,75 @@
+# Runs commands in an Arch Linux container with the repository checked out.
+#
+# Every workflow in this directory calls it, so the container, the pinned
+# actions, the dependency install and the cache are defined here once. The
+# calling workflows only say what to run.
+name: Arch cargo job
+
+on:
+  workflow_call:
+    inputs:
+      script:
+        description: Commands to run from the repository root.
+        type: string
+        required: true
+      build-deps:
+        description: Install the toolchain and libraries needed to compile snitch.
+        type: boolean
+        default: false
+      packages:
+        description: Extra pacman packages, separated by spaces.
+        type: string
+        default: ""
+      cache-key:
+        description: Cache cargo downloads and the target directory under this key. Empty means no cache.
+        type: string
+        default: ""
+      timeout:
+        description: Minutes before the job is stopped.
+        type: number
+        default: 30
+
+permissions:
+  contents: read
+
+jobs:
+  run:
+    name: Arch Linux
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    timeout-minutes: ${{ inputs.timeout }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install dependencies
+        env:
+          BUILD_DEPS: ${{ inputs.build-deps && 'base-devel gtk4 libadwaita gtk4-layer-shell protobuf' || '' }}
+          EXTRA: ${{ inputs.packages }}
+        # $BUILD_DEPS and $EXTRA are meant to split into separate packages.
+        run: pacman -Syu --noconfirm --needed git rust $BUILD_DEPS $EXTRA
+
+      # Actions are pinned to a full commit, so a moved tag can't change what runs.
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - if: inputs.cache-key != ''
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: cargo-${{ inputs.cache-key }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: cargo-${{ inputs.cache-key }}-
+
+      - name: Toolchain versions
+        run: |
+          rustc --version
+          cargo --version
+
+      - name: Run
+        env:
+          SCRIPT: ${{ inputs.script }}
+          CARGO_TERM_COLOR: always
+        run: bash -euo pipefail -c "$SCRIPT"

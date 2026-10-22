@@ -1,0 +1,41 @@
+# Rules for `cargo deny check`, run by CI and worth running before a release.
+# https://embarkstudios.github.io/cargo-deny/
+
+[graph]
+# Only what is built for Linux, the platforms of the Arch package. The Windows
+# and WASI crates in Cargo.lock are never compiled here.
+targets = ["x86_64-unknown-linux-gnu", "aarch64-unknown-linux-gnu"]
+
+[advisories]
+# A known vulnerability, an unmaintained crate or a yanked version fails the
+# check. To accept one, list it here with the reason, after reviewing it.
+unmaintained = "all"
+yanked = "deny"
+ignore = []
+
+[licenses]
+# Every license in the dependency tree today. All are permissive and
+# compatible with this project's MIT license.
+allow = [
+  "MIT",
+  "Apache-2.0",
+  "Apache-2.0 WITH LLVM-exception",
+  "BSD-3-Clause",
+  "Unicode-3.0",
+  "Zlib",
+]
+confidence-threshold = 0.8
+
+[bans]
+# GTK and the protobuf build tools pull in a few crates in two versions. That
+# costs build time, not security, so it only warns.
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+# Code may only come from crates.io and from the h2 fork described in the
+# [patch.crates-io] section of Cargo.toml. Anything else fails.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = ["https://github.com/jeronimoalbi/h2"]

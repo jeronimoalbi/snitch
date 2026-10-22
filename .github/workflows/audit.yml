@@ -1,0 +1,36 @@
+name: Audit
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  schedule:
+    # New security advisories appear without any change to the code,
+    # so the audit also runs every Monday.
+    - cron: "17 5 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Known vulnerabilities, and crates that are yanked or unmaintained.
+  advisories:
+    uses: ./.github/workflows/_arch-cargo.yml
+    with:
+      packages: cargo-audit
+      timeout: 15
+      script: cargo audit --deny warnings
+
+  # Licenses, sources (crates.io and the h2 fork only) and advisories,
+  # as configured in deny.toml.
+  policy:
+    uses: ./.github/workflows/_arch-cargo.yml
+    with:
+      packages: cargo-deny
+      timeout: 15
+      script: cargo deny check

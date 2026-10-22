@@ -1,0 +1,22 @@
+name: Test
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit:
+    uses: ./.github/workflows/_arch-cargo.yml
+    with:
+      build-deps: true
+      cache-key: test
+      script: cargo test --locked

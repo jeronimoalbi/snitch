@@ -39,7 +39,8 @@ makepkg -si
 
 ### Build from source
 
-You need Rust, GTK 4, libadwaita, gtk4-layer-shell and `protoc`.
+You need Rust 1.92 or newer, GTK 4, libadwaita 1.4 or newer, gtk4-layer-shell
+and `protoc`.
 
 ```sh
 cargo build --release

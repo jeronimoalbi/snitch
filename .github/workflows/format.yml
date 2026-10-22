@@ -1,0 +1,23 @@
+name: Format
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  rustfmt:
+    uses: ./.github/workflows/_arch-cargo.yml
+    with:
+      script: |
+        cargo fmt --version
+        cargo fmt --check
+      timeout: 10
