@@ -10,7 +10,7 @@ use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::net::{TcpListener, UnixListener, UnixStream};
@@ -20,6 +20,8 @@ use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream, UnixListenerStre
 use tonic::transport::Server;
 use tonic::{Request, Response, Status, Streaming};
 
+use crate::checksum::{self, Mismatch};
+use crate::link::{Link, Updater};
 use crate::proto::ui_server::{Ui, UiServer};
 use crate::proto::{
     Alert, ClientConfig, Connection, MsgResponse, Notification, NotificationReply, PingReply,
@@ -40,6 +42,10 @@ const DEDUP_WINDOW: Duration = Duration::from_secs(2);
 pub struct PromptRequest {
     pub con: Connection,
     pub settings: Settings,
+    /// Saved rules that pin a different checksum than the running program.
+    pub mismatch: Mismatch,
+    /// Changes daemon rules; `None` in demo mode, where there is no daemon.
+    pub updater: Option<Updater>,
     /// Receives the rule; dropped by the server when the daemon stops waiting.
     pub reply: oneshot::Sender<Option<Rule>>,
 }
@@ -50,6 +56,7 @@ type DedupKey = (u32, String, String, String, u32, String);
 pub struct Service {
     prompts: async_channel::Sender<PromptRequest>,
     settings_path: PathBuf,
+    link: Arc<Link>,
     /// Only one dialog at a time.
     turn: tokio::sync::Mutex<()>,
     recent: Mutex<HashMap<DedupKey, (Instant, Rule)>>,
@@ -61,6 +68,7 @@ impl Service {
         Self {
             prompts,
             settings_path,
+            link: Arc::new(Link::default()),
             turn: tokio::sync::Mutex::new(()),
             recent: Mutex::new(HashMap::new()),
         }
@@ -87,6 +95,8 @@ impl Service {
         let request = PromptRequest {
             con: con.clone(),
             settings: settings.clone(),
+            mismatch: checksum::find(&self.link.rules(), con, now_secs()),
+            updater: Some(Updater::new(self.link.clone())),
             reply,
         };
         self.prompts.send(request).await.ok()?;
@@ -148,6 +158,7 @@ impl Ui for Service {
                     .ok_or_else(|| Status::internal("cannot build a default rule"))?
             }
         };
+        self.link.remember(&rule);
         self.remember(key, &rule);
         Ok(Response::new(rule))
     }
@@ -157,7 +168,13 @@ impl Ui for Service {
         request: Request<ClientConfig>,
     ) -> Result<Response<ClientConfig>, Status> {
         let mut config = request.into_inner();
-        tracing::info!("daemon {} {} connected", config.name, config.version);
+        tracing::info!(
+            "daemon {} {} connected, {} rules",
+            config.name,
+            config.version,
+            config.rules.len()
+        );
+        self.link.replace_rules(config.rules.clone());
         let settings = Settings::load(&self.settings_path);
         if let Ok(mut json) = serde_json::from_str::<serde_json::Value>(&config.config) {
             // The daemon applies this default while a UI is connected.
@@ -179,12 +196,17 @@ impl Ui for Service {
         request: Request<Streaming<NotificationReply>>,
     ) -> Result<Response<Self::NotificationsStream>, Status> {
         // The daemon treats a closed stream as "UI gone", so keep it open for as
-        // long as the daemon keeps its side open. Nothing is ever pushed to it.
+        // long as the daemon keeps its side open. Rule changes are pushed on it
+        // and the daemon's replies are routed back to whoever asked.
         let mut replies = request.into_inner();
-        let (keep_open, stream) = mpsc::channel::<Result<Notification, Status>>(1);
+        let (outbox, stream) = mpsc::channel::<Result<Notification, Status>>(8);
+        self.link.attach(outbox.clone());
+        let link = self.link.clone();
         tokio::spawn(async move {
-            while let Ok(Some(_)) = replies.message().await {}
-            drop(keep_open);
+            while let Ok(Some(reply)) = replies.message().await {
+                link.handle_reply(reply);
+            }
+            link.detach(&outbox);
         });
         Ok(Response::new(Box::pin(ReceiverStream::new(stream))))
     }
@@ -421,5 +443,92 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(ping.into_inner().id, 9);
+    }
+
+    /// Real gRPC round trip: the daemon subscribes with a rule, opens the
+    /// notification stream, and confirms the `CHANGE_RULE` that the dialog's
+    /// "Update rule" button triggers.
+    #[tokio::test]
+    async fn checksum_update_reaches_the_daemon_over_grpc() {
+        use crate::proto::ui_client::UiClient;
+        use crate::proto::{Action, NotificationReplyCode, Operator};
+
+        let (tx, _rx) = async_channel::unbounded::<PromptRequest>();
+        let service = Service::new(tx, PathBuf::from("/nonexistent/settings.conf"));
+        let link = service.link.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(UiServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+
+        let op = |operand: &str, data: &str| Operator {
+            r#type: "simple".into(),
+            operand: operand.into(),
+            data: data.into(),
+            ..Default::default()
+        };
+        let saved = Rule {
+            name: "allow-always-list-curl".into(),
+            enabled: true,
+            duration: "always".into(),
+            operator: Some(Operator {
+                r#type: "list".into(),
+                operand: "list".into(),
+                list: vec![
+                    op("process.path", "/usr/bin/curl"),
+                    op("process.hash.md5", "old"),
+                ],
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+
+        let mut daemon = UiClient::connect(format!("http://{addr}")).await.unwrap();
+        daemon
+            .subscribe(ClientConfig {
+                config: "{}".into(),
+                rules: vec![saved],
+                ..Default::default()
+            })
+            .await
+            .unwrap();
+        let (replies, replies_rx) = mpsc::channel(4);
+        let mut inbox = daemon
+            .notifications(tokio_stream::wrappers::ReceiverStream::new(replies_rx))
+            .await
+            .unwrap()
+            .into_inner();
+
+        // The mismatch is found from the rules the daemon announced.
+        let mut con = con();
+        con.process_checksums
+            .insert("process.hash.md5".into(), "new".into());
+        let found = crate::checksum::find(&link.rules(), &con, now_secs());
+        assert_eq!(found.rule_names, ["allow-always-list-curl"]);
+
+        let updater = Updater::new(link.clone());
+        let update = tokio::spawn(async move {
+            updater
+                .update_checksums(vec!["allow-always-list-curl".into()], "new".into())
+                .await
+        });
+        let notification = inbox.message().await.unwrap().unwrap();
+        assert_eq!(notification.r#type, Action::ChangeRule as i32);
+        let list = &notification.rules[0].operator.as_ref().unwrap().list;
+        assert_eq!(list[1].data, "new");
+        replies
+            .send(NotificationReply {
+                id: notification.id,
+                code: NotificationReplyCode::Ok as i32,
+                data: String::new(),
+            })
+            .await
+            .unwrap();
+        update.await.unwrap().unwrap();
+        assert!(crate::checksum::find(&link.rules(), &con, now_secs()).is_empty());
     }
 }

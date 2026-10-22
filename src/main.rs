@@ -3,8 +3,10 @@
 //! Run without arguments to listen for the daemon (replacing `opensnitch-ui`),
 //! or with `--demo` to preview the dialog with a fake connection.
 
+mod checksum;
 mod demo;
 mod dialog;
+mod link;
 mod model;
 mod rule;
 mod server;
@@ -117,8 +119,13 @@ fn run_demo(app: &adw::Application, scenario: &str, settings_path: &std::path::P
     };
     let settings = Settings::load(settings_path);
     let app = app.clone();
+    let scenario = scenario.to_string();
     glib::spawn_future_local(async move {
-        match dialog::prompt(&app, con, settings, || false).await {
+        let checks = dialog::Checks {
+            mismatch: demo::mismatch(&scenario),
+            updater: None,
+        };
+        match dialog::prompt(&app, con, settings, checks, || false).await {
             Some(rule) => println!(
                 "{}",
                 serde_json::to_string_pretty(&rule::to_json(&rule)).unwrap_or_default()
@@ -181,13 +188,16 @@ fn run_daemon(app: &adw::Application, socket: Option<String>, settings_path: Pat
         while let Ok(PromptRequest {
             con,
             settings,
+            mismatch,
+            updater,
             reply,
         }) = requests.recv().await
         {
             let reply = Rc::new(RefCell::new(Some(reply)));
             let gone = reply.clone();
             let cancelled = move || gone.borrow().as_ref().is_none_or(|r| r.is_closed());
-            let rule = dialog::prompt(&prompt_app, con, settings, cancelled).await;
+            let checks = dialog::Checks { mismatch, updater };
+            let rule = dialog::prompt(&prompt_app, con, settings, checks, cancelled).await;
             if let Some(reply) = reply.borrow_mut().take() {
                 // The daemon may have given up meanwhile; nothing to do then.
                 let _ = reply.send(rule);

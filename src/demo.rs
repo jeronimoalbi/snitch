@@ -1,9 +1,19 @@
 //! Fake connections for `snitch --demo`, to preview the dialog without a daemon.
 
+use crate::checksum::Mismatch;
 use crate::proto::{Connection, StringInt};
 
 /// Names accepted by `--demo-scenario`.
-pub const SCENARIOS: &[&str] = &["curl", "appimage", "snap", "dns", "lan", "icmp", "unknown"];
+pub const SCENARIOS: &[&str] = &[
+    "curl",
+    "appimage",
+    "snap",
+    "dns",
+    "lan",
+    "icmp",
+    "unknown",
+    "badchecksum",
+];
 
 fn tree(entries: &[(&str, u32)]) -> Vec<StringInt> {
     entries
@@ -100,6 +110,10 @@ pub fn scenario(name: &str) -> Option<Connection> {
             con.dst_host = String::new();
             con.dst_port = 0;
         }
+        "badchecksum" => {
+            con.process_path = "/usr/bin/curl".into();
+            con.process_args = vec!["curl".into(), "https://www.example.com".into()];
+        }
         "unknown" => {
             con.process_path = String::new();
             con.process_id = 0;
@@ -109,6 +123,24 @@ pub fn scenario(name: &str) -> Option<Connection> {
         _ => return None,
     }
     Some(con)
+}
+
+/// The checksum mismatch to show for scenario `name`.
+pub fn mismatch(name: &str) -> Mismatch {
+    if name == "badchecksum" {
+        Mismatch {
+            rule_names: vec![
+                "allow-always-list-usr-bin-curl-process-hash-md5".into(),
+                "deny-always-list-usr-bin-curl-443-process-hash-md5".into(),
+            ],
+            expected: vec![
+                "0123456789abcdef0123456789abcdef".into(),
+                "fedcba9876543210fedcba9876543210".into(),
+            ],
+        }
+    } else {
+        Mismatch::default()
+    }
 }
 
 #[cfg(test)]

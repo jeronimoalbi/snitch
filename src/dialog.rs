@@ -10,6 +10,8 @@ use gtk4 as gtk;
 use gtk4_layer_shell::{Edge, KeyboardMode, Layer, LayerShell};
 use libadwaita as adw;
 
+use crate::checksum::{self, Mismatch};
+use crate::link::Updater;
 use crate::model::{self, Target};
 use crate::proto::{Connection, Rule};
 use crate::rule::{self, Action, Choice, DURATIONS};
@@ -18,6 +20,14 @@ use crate::view;
 
 const WIDTH: i32 = 540;
 const MARGIN: i32 = 16;
+
+/// Checksum information shown with the prompt.
+pub struct Checks {
+    /// Saved rules that pin a different checksum than the running program.
+    pub mismatch: Mismatch,
+    /// Changes daemon rules; `None` in demo mode, where updates are only pretended.
+    pub updater: Option<Updater>,
+}
 
 /// Shows the prompt for `con` and resolves to the user's rule.
 ///
@@ -28,13 +38,14 @@ pub async fn prompt(
     app: &adw::Application,
     con: Connection,
     settings: Settings,
+    checks: Checks,
     cancelled: impl Fn() -> bool + 'static,
 ) -> Option<Rule> {
     if settings.popups_disabled() {
         return rule::default_rule(&con, &settings, None, now_secs());
     }
     let (result, answer) = async_channel::bounded(1);
-    let dialog = Dialog::new(app, con, settings, result);
+    let dialog = Dialog::new(app, con, settings, checks, result);
     dialog.start(cancelled);
     answer.recv().await.ok().flatten()
 }
@@ -78,6 +89,38 @@ fn padded_box(spacing: i32) -> gtk::Box {
     b
 }
 
+/// A dropdown of `names` whose entries are cut short instead of widening the window.
+fn name_dropdown(names: &[String]) -> gtk::DropDown {
+    let names: Vec<&str> = names.iter().map(String::as_str).collect();
+    let dd = gtk::DropDown::from_strings(&names);
+    let factory = gtk::SignalListItemFactory::new();
+    factory.connect_setup(|_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let l = label("");
+        l.set_wrap(false);
+        l.set_ellipsize(gtk::pango::EllipsizeMode::Middle);
+        l.set_max_width_chars(44);
+        item.set_child(Some(&l));
+    });
+    factory.connect_bind(|_, item| {
+        let Some(item) = item.downcast_ref::<gtk::ListItem>() else {
+            return;
+        };
+        let text = item
+            .item()
+            .and_downcast::<gtk::StringObject>()
+            .map(|s| s.string());
+        if let (Some(text), Some(l)) = (text, item.child().and_downcast::<gtk::Label>()) {
+            l.set_text(&text);
+        }
+    });
+    dd.set_factory(Some(&factory));
+    dd.set_hexpand(true);
+    dd
+}
+
 fn dropdown(targets: &[Target]) -> gtk::DropDown {
     let labels: Vec<&str> = targets.iter().map(|t| t.label.as_str()).collect();
     let dd = gtk::DropDown::from_strings(&labels);
@@ -100,6 +143,7 @@ struct Dialog {
     check_uid: gtk::CheckButton,
     check_sum: gtk::CheckButton,
     advanced: gtk::ToggleButton,
+    checks: Checks,
     allow_btn: gtk::Button,
     deny_btn: adw::SplitButton,
     default_action: Action,
@@ -115,6 +159,7 @@ impl Dialog {
         app: &adw::Application,
         con: Connection,
         settings: Settings,
+        checks: Checks,
         result: async_channel::Sender<Option<Rule>>,
     ) -> Rc<Self> {
         let info = desktop_info(&con.process_path);
@@ -190,6 +235,7 @@ impl Dialog {
             check_uid,
             check_sum,
             advanced,
+            checks,
             allow_btn,
             deny_btn,
             default_action,
@@ -256,6 +302,7 @@ impl Dialog {
 
         let message = label(&view::popup_message(app_name, con));
         message.set_use_markup(true);
+        let warning = self.checksum_warning();
 
         // Advanced rows.
         let grid = gtk::Grid::new();
@@ -309,6 +356,9 @@ impl Dialog {
         let main = padded_box(14);
         main.append(&header);
         main.append(&message);
+        if let Some(warning) = &warning {
+            main.append(warning);
+        }
         main.append(&revealer);
         main.append(&actions);
 
@@ -332,6 +382,10 @@ impl Dialog {
 
         self.stack.add_named(&main, Some("main"));
         self.stack.add_named(&details, Some("details"));
+        if !self.checks.mismatch.is_empty() {
+            self.stack
+                .add_named(&self.checksums_page(), Some("checksums"));
+        }
 
         let bar = adw::HeaderBar::new();
         bar.set_show_end_title_buttons(false);
@@ -364,6 +418,100 @@ impl Dialog {
         }
         popover.set_child(Some(&menu));
         self.deny_btn.set_popover(Some(&popover));
+    }
+
+    /// The red warning under the message, with a link to the checksums page.
+    fn checksum_warning(self: &Rc<Self>) -> Option<gtk::Label> {
+        if self.checks.mismatch.is_empty() {
+            return None;
+        }
+        let warning = label("WARNING, bad checksum (<a href=\"#warning-checksum\">More info</a>)");
+        warning.set_use_markup(true);
+        warning.add_css_class("error");
+        let d = self.clone();
+        warning.connect_activate_link(move |_, _| {
+            d.stop_countdown();
+            d.stack.set_visible_child_name("checksums");
+            gtk::glib::Propagation::Stop
+        });
+        Some(warning)
+    }
+
+    /// Page to pin the program's current checksum in the rules that disagree.
+    fn checksums_page(self: &Rc<Self>) -> gtk::Box {
+        let note = label(&view::printable_lines(&checksum::note(
+            &self.con,
+            &self.checks.mismatch,
+        )));
+        note.set_selectable(true);
+        note.set_wrap_mode(gtk::pango::WrapMode::Char);
+
+        let names = name_dropdown(&self.checks.mismatch.rule_names);
+        let status = label("");
+        let update = gtk::Button::with_label("Update rule");
+        let update_all = gtk::Button::with_label("Update all");
+        let back = gtk::Button::with_label("Back");
+        let buttons = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+        buttons.set_halign(gtk::Align::End);
+        for b in [&update, &update_all, &back] {
+            buttons.append(b);
+        }
+
+        // `update_all` asks for every rule in the list, `update` for the selected one.
+        for (button, all) in [(&update, false), (&update_all, true)] {
+            let (d, names, status, buttons) =
+                (self.clone(), names.clone(), status.clone(), buttons.clone());
+            button.connect_clicked(move |_| {
+                let selected = names
+                    .selected_item()
+                    .and_downcast::<gtk::StringObject>()
+                    .map(|s| s.string().to_string());
+                let targets = match (all, selected) {
+                    (true, _) => d.checks.mismatch.rule_names.clone(),
+                    (false, Some(name)) => vec![name],
+                    (false, None) => return,
+                };
+                d.update_rules(targets, &status, &buttons);
+            });
+        }
+        let d = self.clone();
+        back.connect_clicked(move |_| d.stack.set_visible_child_name("main"));
+
+        let page = padded_box(12);
+        page.append(&note);
+        page.append(&names);
+        page.append(&status);
+        page.append(&buttons);
+        page
+    }
+
+    /// Pins the program's checksum in `names` and reports the outcome in `status`.
+    fn update_rules(self: &Rc<Self>, names: Vec<String>, status: &gtk::Label, buttons: &gtk::Box) {
+        let md5 = view::md5(&self.con).to_string();
+        let updater = self.checks.updater.clone();
+        let (status, buttons) = (status.clone(), buttons.clone());
+        status.remove_css_class("error");
+        status.remove_css_class("success");
+        status.set_text("Updating...");
+        buttons.set_sensitive(false);
+        gtk::glib::spawn_future_local(async move {
+            let outcome = match updater {
+                Some(updater) => updater.update_checksums(names, md5).await,
+                // Demo mode has no daemon: pretend it worked.
+                None => Ok(()),
+            };
+            match outcome {
+                Ok(()) => {
+                    status.add_css_class("success");
+                    status.set_text("\u{2714} Rule updated.");
+                }
+                Err(err) => {
+                    status.add_css_class("error");
+                    status.set_text(&format!("\u{2718} {}", view::printable(&err)));
+                }
+            }
+            buttons.set_sensitive(true);
+        });
     }
 
     /// Action of the deny button: the saved default unless that is "allow".

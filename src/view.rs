@@ -37,6 +37,13 @@ pub fn printable(text: &str) -> String {
     text.chars().filter(|c| !c.is_control()).collect()
 }
 
+/// Like [`printable`] but keeps line breaks.
+pub fn printable_lines(text: &str) -> String {
+    text.chars()
+        .filter(|c| *c == '\n' || !c.is_control())
+        .collect()
+}
+
 /// Application name: desktop entry name, else the binary name.
 pub fn app_name(desktop_name: Option<&str>, con: &Connection) -> String {
     if let Some(name) = desktop_name.filter(|n| !n.is_empty()) {
