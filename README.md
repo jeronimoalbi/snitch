@@ -1,5 +1,9 @@
 # snitch
 
+[![Test](https://github.com/jeronimoalbi/snitch/actions/workflows/test.yml/badge.svg?branch=master)](https://github.com/jeronimoalbi/snitch/actions/workflows/test.yml)
+[![Audit](https://github.com/jeronimoalbi/snitch/actions/workflows/audit.yml/badge.svg?branch=master)](https://github.com/jeronimoalbi/snitch/actions/workflows/audit.yml)
+[![License: MIT](https://img.shields.io/github/license/jeronimoalbi/snitch)](LICENSE)
+
 A GTK4 prompt for [OpenSnitch](https://github.com/evilsocket/opensnitch).
 
 <p align="center">
