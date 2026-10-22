@@ -2,13 +2,11 @@
 
 A GTK4 / libadwaita replacement for the OpenSnitch Qt **connection prompt**.
 
-- Listens on the same gRPC socket as `opensnitch-ui` and asks you what to do with each new connection.
-- Shows a dialog equivalent to the Qt one.
-- Follows the defaults saved by the Qt UI (`~/.config/opensnitch/settings.conf`, read-only).
+Snitch listens on the same gRPC socket as `opensnitch-ui` and asks you what to do with each new connection.
+
+It also uses the defaults saved by the Qt UI (`~/.config/opensnitch/settings.conf`, read-only).
 
 ![snitch prompt dialog](docs/screenshots/dialog.png)
-
-> Only one UI can own the socket. Stop `opensnitch-ui` (and `opensnitch-zenity`) before starting `snitch`.
 
 ## Usage
 
@@ -17,6 +15,8 @@ snitch                          # listen for the daemon and prompt for connectio
 snitch --demo                   # preview the dialog and print the resulting rule as JSON
 snitch --demo-scenario appimage # preview a specific scenario
 ```
+
+> Only one UI can own the socket, stop `opensnitch-ui` before starting `snitch`.
 
 ### Options
 
