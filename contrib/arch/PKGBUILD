@@ -14,6 +14,7 @@ depends=(
   libadwaita
   opensnitch
 )
+optdepends=('polkit: authorise turning the firewall off from other programs')
 makedepends=(
   cargo
   git
@@ -48,5 +49,7 @@ package() {
   install -Dm755 target/release/snitch "$pkgdir/usr/bin/snitch"
   # A user unit: it has to run inside the graphical session to open windows.
   install -Dm644 contrib/systemd/snitch.service "$pkgdir/usr/lib/systemd/user/snitch.service"
+  install -Dm644 contrib/polkit/io.github.jeronimoalbi.Snitch.policy \
+    "$pkgdir/usr/share/polkit-1/actions/io.github.jeronimoalbi.Snitch.policy"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }

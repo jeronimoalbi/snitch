@@ -3,6 +3,7 @@
 //! Run without arguments to listen for the daemon (replacing `opensnitch-ui`),
 //! or with `--demo` to preview the dialog with a fake connection.
 
+mod bus;
 mod checksum;
 mod demo;
 mod dialog;
@@ -22,6 +23,7 @@ use gtk4::glib;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
+use crate::link::Updater;
 use crate::server::{PromptRequest, Service};
 use crate::settings::{DEFAULT_ADDRESS, Settings};
 
@@ -176,18 +178,21 @@ fn run_daemon(
 
     let (prompts, requests) = async_channel::unbounded::<PromptRequest>();
     let service = Service::new(prompts, settings_path);
+    let link = service.link();
+    link.keep_pause_in(glib::user_runtime_dir().join("snitch-paused"));
+    let runtime = match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            tracing::error!("cannot start the async runtime: {err}");
+            std::process::exit(1);
+        }
+    };
+    let updater = Updater::on(link, runtime.handle().clone());
     let serve_address = address.clone();
     std::thread::spawn(move || {
-        let runtime = match tokio::runtime::Builder::new_multi_thread()
-            .enable_all()
-            .build()
-        {
-            Ok(runtime) => runtime,
-            Err(err) => {
-                tracing::error!("cannot start the async runtime: {err}");
-                std::process::exit(1);
-            }
-        };
         let outcome = runtime.block_on(async {
             tokio::select! {
                 result = server::serve(&serve_address, service, &allow_uids) => result,
@@ -204,6 +209,7 @@ fn run_daemon(
         }
         std::process::exit(0);
     });
+    bus::serve(updater);
 
     // Prompts are handled one after another on the GTK thread.
     let prompt_app = app.clone();

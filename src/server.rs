@@ -144,6 +144,11 @@ impl Service {
         }
     }
 
+    /// What the daemon connection shares with the rest of the program.
+    pub fn link(&self) -> Arc<Link> {
+        self.link.clone()
+    }
+
     fn cached(&self, key: &DedupKey) -> Option<Rule> {
         let recent = self.recent.lock().ok()?;
         recent
@@ -279,6 +284,8 @@ impl Ui for Service {
         let (outbox, stream) = mpsc::channel::<Result<Notification, Status>>(8);
         self.link.attach(outbox.clone());
         let link = self.link.clone();
+        let resume = self.link.clone();
+        tokio::spawn(async move { resume.resume_if_paused().await });
         tokio::spawn(async move {
             while let Ok(Some(reply)) = replies.message().await {
                 link.handle_reply(reply);

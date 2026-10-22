@@ -4,7 +4,7 @@
 # before a release exists. Commit your changes first: uncommitted files are
 # not part of the package. Run `makepkg -si` from this directory.
 pkgname=snitch-git
-pkgver=0.9.0
+pkgver=0.9.0.r19.ge28067b
 pkgrel=1
 pkgdesc='GTK4 prompt dialog for the OpenSnitch daemon'
 arch=(x86_64 aarch64)
@@ -18,6 +18,7 @@ depends=(
   libadwaita
   opensnitch
 )
+optdepends=('polkit: authorise turning the firewall off from other programs')
 makedepends=(
   cargo
   git
@@ -61,5 +62,7 @@ package() {
   install -Dm755 target/release/snitch "$pkgdir/usr/bin/snitch"
   # A user unit: it has to run inside the graphical session to open windows.
   install -Dm644 contrib/systemd/snitch.service "$pkgdir/usr/lib/systemd/user/snitch.service"
+  install -Dm644 contrib/polkit/io.github.jeronimoalbi.Snitch.policy \
+    "$pkgdir/usr/share/polkit-1/actions/io.github.jeronimoalbi.Snitch.policy"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/snitch/LICENSE"
 }

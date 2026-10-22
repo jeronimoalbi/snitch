@@ -172,6 +172,14 @@ desktop notification saying what happened, for example **Connection dropped**:
 - It has no settings of its own, and the Qt UI's notification settings are not
   used.
 
+### Top-bar switch for GNOME
+
+An optional [GNOME Shell extension](contrib/gnome-extension/README.md) puts an
+eye in the top bar that shows whether the firewall is on and turns it on or off.
+Snitch offers this switch on the session D-Bus. Turning the firewall **off** asks
+for your password through polkit, because any program running as you could call
+it. Turning it on is open to all, and every change shows a notification.
+
 ### Logs
 
 Snitch writes each question and answer to the journal, so you can see what
@@ -229,6 +237,10 @@ even turn the firewall off. So snitch takes some care:
   (`--socket host:port`) can't tell who is connecting, so snitch warns and
   accepts any local process. Use `--allow-uid <uid>` only for development, for
   example to run a test client as yourself.
+- **Pausing needs authorisation.** The D-Bus switch only turns the firewall on
+  freely. Turning it off must pass polkit, so a program of yours can't do it
+  silently. Without polkit, snitch refuses. A paused firewall is turned back on
+  when snitch or the daemon reconnects.
 - **Names can't widen a rule.** Choices like "AppImage" or `*.example.com` build
   a matching pattern from a program's path or a host name, which a hostile
   program or a forged DNS answer controls. Every part is escaped, and the

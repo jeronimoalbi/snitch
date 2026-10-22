@@ -1,15 +1,17 @@
 //! State shared with the daemon connection: the rules the daemon has loaded,
-//! and the notification stream used to change them.
+//! whether it is intercepting connections, and the notification stream used to
+//! change them.
 //!
 //! The daemon sends every loaded rule in `Subscribe`. Its rule files are only
 //! readable by root, so this copy is how the dialog learns about saved rules.
 
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 use tonic::Status;
 
 use crate::checksum;
@@ -30,13 +32,61 @@ pub struct Outcome {
     pub error: Option<String>,
 }
 
+/// Whether the daemon intercepts connections.
+///
+/// The daemon never reports this, so it is what this UI last asked for and the
+/// daemon confirmed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Interception {
+    /// The daemon is not connected, so nothing is known.
+    #[default]
+    Unknown,
+    On,
+    Off,
+}
+
+impl Interception {
+    /// The name used on the D-Bus interface.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Unknown => "unknown",
+            Self::On => "on",
+            Self::Off => "off",
+        }
+    }
+}
+
+/// What this UI knows about the daemon.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DaemonState {
+    /// The daemon holds its notification stream open.
+    pub connected: bool,
+    pub interception: Interception,
+}
+
 /// Rules known to the daemon and the channel to send it notifications.
-#[derive(Default)]
 pub struct Link {
     rules: Mutex<HashMap<String, Rule>>,
     stream: Mutex<Option<Outbox>>,
     pending: Mutex<HashMap<u64, oneshot::Sender<Verdict>>>,
     next_id: AtomicU64,
+    status: watch::Sender<DaemonState>,
+    /// A file that exists while interception is paused, so a restart of this
+    /// program turns it back on instead of forgetting it.
+    pause_marker: OnceLock<PathBuf>,
+}
+
+impl Default for Link {
+    fn default() -> Self {
+        Self {
+            rules: Mutex::default(),
+            stream: Mutex::default(),
+            pending: Mutex::default(),
+            next_id: AtomicU64::default(),
+            status: watch::channel(DaemonState::default()).0,
+            pause_marker: OnceLock::new(),
+        }
+    }
 }
 
 /// Locks `mutex`, ignoring poisoning: the data is plain maps that stay valid.
@@ -66,9 +116,60 @@ impl Link {
         lock(&self.rules).values().cloned().collect()
     }
 
+    /// Remembers a pause in `path`, which should live somewhere cleared at
+    /// logout, such as the runtime directory. Only the first call counts.
+    pub fn keep_pause_in(&self, path: PathBuf) {
+        let _ = self.pause_marker.set(path);
+    }
+
+    /// What is known about the daemon right now.
+    pub fn status(&self) -> DaemonState {
+        *self.status.borrow()
+    }
+
+    /// Receives every change of [`DaemonState`].
+    pub fn watch(&self) -> watch::Receiver<DaemonState> {
+        self.status.subscribe()
+    }
+
+    /// True when a pause was recorded and not undone.
+    fn paused_before(&self) -> bool {
+        self.pause_marker.get().is_some_and(|path| path.exists())
+    }
+
+    fn record_pause(&self, paused: bool) {
+        let Some(path) = self.pause_marker.get() else {
+            return;
+        };
+        let done = if paused {
+            std::fs::write(path, b"")
+        } else {
+            std::fs::remove_file(path).or_else(|err| match err.kind() {
+                std::io::ErrorKind::NotFound => Ok(()),
+                _ => Err(err),
+            })
+        };
+        if let Err(err) = done {
+            tracing::warn!("cannot update {}: {err}", path.display());
+        }
+    }
+
     /// Starts using `outbox` as the daemon's notification stream.
+    ///
+    /// A daemon that connects is taken to intercept, because only a UI can
+    /// turn that off, unless this program paused it before (see
+    /// [`Link::resume_if_paused`]).
     pub fn attach(&self, outbox: Outbox) {
         *lock(&self.stream) = Some(outbox);
+        let paused = self.status().interception == Interception::Off || self.paused_before();
+        self.status.send_modify(|status| {
+            status.connected = true;
+            status.interception = if paused {
+                Interception::Off
+            } else {
+                Interception::On
+            };
+        });
     }
 
     /// Stops using `outbox`, unless a newer stream has replaced it.
@@ -76,6 +177,20 @@ impl Link {
         let mut stream = lock(&self.stream);
         if stream.as_ref().is_some_and(|s| s.same_channel(outbox)) {
             *stream = None;
+            self.status.send_replace(DaemonState::default());
+        }
+    }
+
+    /// Turns interception back on when it was paused before the daemon
+    /// (re)connected. A restart of this program or of the daemon must never
+    /// leave the firewall silently off.
+    pub async fn resume_if_paused(&self) {
+        if self.status().interception != Interception::Off {
+            return;
+        }
+        match self.set_interception(true).await {
+            Ok(()) => tracing::info!("interception was paused; turned it back on"),
+            Err(err) => tracing::warn!("cannot turn interception back on: {err}"),
         }
     }
 
@@ -93,8 +208,9 @@ impl Link {
         let _ = waiter.send(verdict);
     }
 
-    /// Asks the daemon to replace `rule` and waits for its answer.
-    async fn change_rule(&self, rule: Rule) -> Verdict {
+    /// Sends the notification `build` makes for a fresh id and waits for the
+    /// daemon's answer.
+    async fn request(&self, build: impl FnOnce(u64) -> Notification) -> Verdict {
         let outbox = lock(&self.stream)
             .clone()
             .ok_or("the daemon is not connected")?;
@@ -102,13 +218,7 @@ impl Link {
         let (waiter, answer) = oneshot::channel();
         lock(&self.pending).insert(id, waiter);
 
-        let notification = Notification {
-            id,
-            r#type: Action::ChangeRule as i32,
-            rules: vec![rule.clone()],
-            ..Default::default()
-        };
-        if outbox.try_send(Ok(notification)).is_err() {
+        if outbox.try_send(Ok(build(id))).is_err() {
             lock(&self.pending).remove(&id);
             return Err("cannot reach the daemon".into());
         }
@@ -118,10 +228,48 @@ impl Link {
             Err(_) => Err("the daemon did not answer".into()),
         };
         lock(&self.pending).remove(&id);
+        verdict
+    }
+
+    /// Asks the daemon to replace `rule` and waits for its answer.
+    async fn change_rule(&self, rule: Rule) -> Verdict {
+        let verdict = self
+            .request(|id| Notification {
+                id,
+                r#type: Action::ChangeRule as i32,
+                rules: vec![rule.clone()],
+                ..Default::default()
+            })
+            .await;
         if verdict.is_ok() {
             self.remember(&rule);
         }
         verdict
+    }
+
+    /// Asks the daemon to start or stop intercepting connections. The state
+    /// changes only when the daemon confirms.
+    pub async fn set_interception(&self, on: bool) -> Verdict {
+        let action = if on {
+            Action::EnableInterception
+        } else {
+            Action::DisableInterception
+        };
+        self.request(|id| Notification {
+            id,
+            r#type: action as i32,
+            ..Default::default()
+        })
+        .await?;
+        self.record_pause(!on);
+        self.status.send_modify(|status| {
+            status.interception = if on {
+                Interception::On
+            } else {
+                Interception::Off
+            };
+        });
+        Ok(())
     }
 
     /// Pins `md5` in the named rules. Stops at the first failure.
@@ -158,10 +306,31 @@ pub struct Updater {
 impl Updater {
     /// Must be created from inside the tokio runtime.
     pub fn new(link: std::sync::Arc<Link>) -> Self {
-        Self {
-            link,
-            runtime: tokio::runtime::Handle::current(),
-        }
+        Self::on(link, tokio::runtime::Handle::current())
+    }
+
+    /// Runs the work on `runtime`.
+    pub fn on(link: std::sync::Arc<Link>, runtime: tokio::runtime::Handle) -> Self {
+        Self { link, runtime }
+    }
+
+    /// What is known about the daemon right now.
+    pub fn status(&self) -> DaemonState {
+        self.link.status()
+    }
+
+    /// Receives every change of [`DaemonState`].
+    pub fn watch(&self) -> watch::Receiver<DaemonState> {
+        self.link.watch()
+    }
+
+    /// Starts or stops interception.
+    pub async fn set_interception(&self, on: bool) -> Result<(), String> {
+        let link = self.link.clone();
+        let task = self
+            .runtime
+            .spawn(async move { link.set_interception(on).await });
+        task.await.unwrap_or_else(|err| Err(err.to_string()))
     }
 
     /// Pins `md5` in the rules called `names`.
@@ -312,5 +481,98 @@ mod tests {
         assert!(lock(&link.stream).is_some());
         link.detach(&new);
         assert!(lock(&link.stream).is_none());
+    }
+
+    /// A fresh path in the temporary directory for one test.
+    fn scratch(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("snitch-test-{}-{name}", std::process::id()))
+    }
+
+    #[tokio::test]
+    async fn interception_changes_only_when_the_daemon_confirms() {
+        let link = Arc::new(Link::default());
+        let (outbox, _inbox) = mpsc::channel(8);
+        link.attach(outbox);
+        assert_eq!(link.status().interception, Interception::On);
+
+        let mut seen = daemon(&link, NotificationReplyCode::Error);
+        let err = link.set_interception(false).await.unwrap_err();
+        assert!(err.contains("boom"), "{err}");
+        assert_eq!(link.status().interception, Interception::On);
+        let sent = seen.recv().await.unwrap();
+        assert_eq!(sent.r#type, Action::DisableInterception as i32);
+
+        let mut seen = daemon(&link, NotificationReplyCode::Ok);
+        link.set_interception(false).await.unwrap();
+        assert_eq!(link.status().interception, Interception::Off);
+        link.set_interception(true).await.unwrap();
+        assert_eq!(link.status().interception, Interception::On);
+        assert_eq!(
+            seen.recv().await.unwrap().r#type,
+            Action::DisableInterception as i32
+        );
+        assert_eq!(
+            seen.recv().await.unwrap().r#type,
+            Action::EnableInterception as i32
+        );
+    }
+
+    #[tokio::test]
+    async fn status_follows_the_connection() {
+        let link = Arc::new(Link::default());
+        let mut changes = link.watch();
+        assert_eq!(link.status(), DaemonState::default());
+
+        let (outbox, _inbox) = mpsc::channel(1);
+        link.attach(outbox.clone());
+        changes.changed().await.unwrap();
+        assert_eq!(
+            *changes.borrow_and_update(),
+            DaemonState {
+                connected: true,
+                interception: Interception::On
+            }
+        );
+        link.detach(&outbox);
+        assert_eq!(link.status(), DaemonState::default());
+    }
+
+    #[tokio::test]
+    async fn a_pause_survives_a_restart_and_is_undone_on_connect() {
+        let marker = scratch("pause");
+        let _ = std::fs::remove_file(&marker);
+
+        let link = Arc::new(Link::default());
+        link.keep_pause_in(marker.clone());
+        let (outbox, _inbox) = mpsc::channel(8);
+        link.attach(outbox);
+        let _seen = daemon(&link, NotificationReplyCode::Ok);
+        link.set_interception(false).await.unwrap();
+        assert!(marker.exists());
+
+        // A new process: nothing in memory, but the marker is still there.
+        let restarted = Arc::new(Link::default());
+        restarted.keep_pause_in(marker.clone());
+        let (outbox, _inbox) = mpsc::channel(8);
+        restarted.attach(outbox);
+        assert_eq!(restarted.status().interception, Interception::Off);
+        let mut seen = daemon(&restarted, NotificationReplyCode::Ok);
+        restarted.resume_if_paused().await;
+        assert_eq!(restarted.status().interception, Interception::On);
+        assert_eq!(
+            seen.recv().await.unwrap().r#type,
+            Action::EnableInterception as i32
+        );
+        assert!(!marker.exists());
+    }
+
+    #[tokio::test]
+    async fn nothing_is_sent_when_interception_was_never_paused() {
+        let link = Arc::new(Link::default());
+        let (outbox, mut inbox) = mpsc::channel(8);
+        link.attach(outbox);
+        link.resume_if_paused().await;
+        assert!(inbox.try_recv().is_err());
+        assert_eq!(link.status().interception, Interception::On);
     }
 }

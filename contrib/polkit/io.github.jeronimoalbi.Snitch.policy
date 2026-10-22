@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1/policyconfig.dtd">
+<policyconfig>
+  <vendor>snitch</vendor>
+  <vendor_url>https://github.com/jeronimoalbi/snitch</vendor_url>
+
+  <!-- Asked before snitch lets a program of the session pause the firewall,
+       for example the GNOME Shell extension. Turning it back on is not
+       guarded. To skip the password prompt, add a polkit rule for this
+       action (see the extension README). -->
+  <action id="io.github.jeronimoalbi.Snitch.disable-interception">
+    <description>Turn the OpenSnitch firewall off</description>
+    <message>Authentication is required to turn the OpenSnitch firewall off</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>auth_self</allow_active>
+    </defaults>
+  </action>
+</policyconfig>
