@@ -1,1 +1,11 @@
 /target
+
+# makepkg output
+/contrib/arch/src/
+/contrib/arch/pkg/
+/contrib/arch/*.tar.gz
+/contrib/arch/*.pkg.tar.*
+/contrib/arch/local/snitch-git/
+/contrib/arch/local/src/
+/contrib/arch/local/pkg/
+/contrib/arch/local/*.pkg.tar.*

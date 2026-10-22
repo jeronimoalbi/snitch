@@ -84,7 +84,34 @@ When a saved rule pins a program's MD5 and the running binary has a different on
 
 ## Install
 
-### Build
+### Arch Linux
+
+The package in `contrib/arch` builds a tagged release and installs the binary, the systemd user unit and the license.
+
+```sh
+cd contrib/arch
+makepkg -si
+```
+
+| Kind          | Packages                                                       |
+|---------------|----------------------------------------------------------------|
+| Runtime       | `gtk4`, `libadwaita`, `gtk4-layer-shell`, `opensnitch`         |
+| Build only    | `cargo`, `protobuf`                                            |
+
+The unit is installed to `/usr/lib/systemd/user/`, so skip the copy step below and go straight to enabling it.
+
+#### From a local checkout
+
+To install before a release exists, `contrib/arch/local` builds the **committed** `HEAD` of your checkout as `snitch-git`. Commit your changes first, since uncommitted files are not included.
+
+```sh
+cd contrib/arch/local
+makepkg -si
+```
+
+The version is `<Cargo version>.r<commit count>.g<short hash>`, so every new commit builds as an upgrade. It provides and conflicts with `snitch`, so only one of the two can be installed.
+
+### Build from source
 
 Requires Rust, GTK 4, libadwaita and gtk4-layer-shell, plus `protoc`.
 
@@ -98,6 +125,7 @@ sudo install -Dm755 target/release/snitch /usr/bin/snitch
 The unit in `contrib/systemd/snitch.service` is a **systemd user service**, so it runs inside your graphical session where it can open windows.
 
 ```sh
+# Not needed with the Arch package, which installs the unit for you:
 install -Dm644 contrib/systemd/snitch.service ~/.config/systemd/user/snitch.service
 systemctl --user daemon-reload
 systemctl --user enable --now snitch.service

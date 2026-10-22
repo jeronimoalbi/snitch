@@ -1,8 +1,9 @@
 [package]
 name = "snitch"
-version = "0.1.0"
+version = "0.9.0"
 edition = "2024"
 description = "GTK4 prompt UI for the OpenSnitch daemon"
+license = "MIT"
 
 [dependencies]
 async-channel = "2.5.0"
