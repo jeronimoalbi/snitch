@@ -30,7 +30,6 @@ pub mod operand {
 }
 
 const APPIMAGE_PREFIX: &str = "/tmp/.mount_";
-const SNAP_PREFIX: &str = "/snap";
 
 /// Network aliases from the Qt UI's `network_aliases.json`.
 const ALIASES: &[(&str, &[&str])] = &[
@@ -114,93 +113,83 @@ pub fn command_line(con: &Connection) -> String {
     con.process_args.join(" ")
 }
 
-/// The operator for `field`, computed from the connection and the combo `label`.
-fn operator_for(field: Field, label: &str, con: &Connection) -> Op {
-    let last_word = || label.rsplit(' ').next().unwrap_or_default().to_string();
-    match field {
-        Field::ProcPath => Op::simple(operand::PROCESS_PATH, &con.process_path),
-        Field::ProcArgs if con.process_args.first().is_none_or(String::is_empty) => {
-            Op::simple(operand::PROCESS_PATH, &con.process_path)
+/// Escapes `text` so that a regular expression matches it literally.
+///
+/// This is the set Go's `regexp.QuoteMeta` escapes, the engine the daemon uses.
+/// Everything that comes from a program or the network (paths, host names) must
+/// go through it: unescaped, a name like `x|.*` would turn a rule into one that
+/// matches every program.
+pub fn regex_escape(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        if "\\.+*?()|[]{}^$".contains(ch) {
+            out.push('\\');
         }
-        Field::ProcArgs => Op::simple(operand::PROCESS_COMMAND, command_line(con)),
-        Field::ProcId => Op::simple(operand::PROCESS_ID, con.process_id.to_string()),
-        Field::UserId => Op::simple(operand::USER_ID, con.user_id.to_string()),
-        Field::DstPort => Op::simple(operand::DEST_PORT, con.dst_port.to_string()),
-        Field::DstIp => Op::simple(operand::DEST_IP, &con.dst_ip),
-        Field::DstHost => Op::simple(operand::DEST_HOST, label),
-        Field::DstNetwork => Op {
-            kind: kind::NETWORK,
-            operand: operand::DEST_NETWORK,
-            data: last_word(),
-        },
-        Field::RegexHost => {
-            // "to *.yahoo.com" -> ^(|.*\.)yahoo\.com$
-            let domain = last_word().trim_start_matches("*.").replace('.', "\\.");
-            Op {
-                kind: kind::REGEXP,
-                operand: operand::DEST_HOST,
-                data: format!("^(|.*\\.){domain}$"),
-            }
-        }
-        Field::RegexIp => {
-            // "to 1.2.*" -> 1\.2\..*
-            let data = last_word().replace('.', "\\.").replace('*', ".*");
-            Op {
-                kind: kind::REGEXP,
-                operand: operand::DEST_IP,
-                data,
-            }
-        }
-        Field::AppImage => {
-            let (dir, bin) = split_path(&con.process_path);
-            let dir: String = dir
-                .replace('.', "\\.")
-                .chars()
-                .take(APPIMAGE_PREFIX.len() + 1 + 6)
-                .collect();
-            Op {
-                kind: kind::REGEXP,
-                operand: operand::PROCESS_PATH,
-                data: format!("^{dir}[0-9A-Za-z]+\\/.*{bin}$"),
-            }
-        }
-        Field::Snap => {
-            let parts: Vec<&str> = con.process_path.split('/').collect();
-            let app = parts.get(2).copied().unwrap_or_default();
-            let rest = parts.get(4..).unwrap_or_default().join("\\/");
-            let prefix = parts.get(1).copied().unwrap_or_default();
-            Op {
-                kind: kind::REGEXP,
-                operand: operand::PROCESS_PATH,
-                data: format!("^\\/{prefix}\\/{app}\\/[0-9]+\\/{rest}$"),
-            }
-        }
+        out.push(ch);
+    }
+    out
+}
+
+/// A target whose operator is built from the connection, not from its label.
+///
+/// The label is shown to the user, so control characters are dropped from it.
+/// The operator keeps the exact text.
+fn target(field: Field, label: impl AsRef<str>, op: Op) -> Target {
+    Target::new(crate::view::printable(label.as_ref()), field, op)
+}
+
+fn network_op(data: impl Into<String>) -> Op {
+    Op {
+        kind: kind::NETWORK,
+        operand: operand::DEST_NETWORK,
+        data: data.into(),
     }
 }
 
-/// Splits a path into `(directory, file name)` like Python's `dirname`/`basename`.
-fn split_path(path: &str) -> (&str, &str) {
-    path.rsplit_once('/').unwrap_or(("", path))
-}
-
-fn target(field: Field, label: String, con: &Connection) -> Target {
-    let op = operator_for(field, &label, con);
-    Target::new(label, field, op)
+fn regexp_op(operand: &'static str, data: String) -> Op {
+    Op {
+        kind: kind::REGEXP,
+        operand,
+        data,
+    }
 }
 
 /// The six fixed entries, in the order the Qt preferences use for the default target.
 fn fixed_targets(con: &Connection) -> Vec<Target> {
-    let mut exe = target(Field::ProcPath, "from this executable".into(), con);
-    exe.enabled = con.process_id != UNKNOWN;
-    let mut uid = target(Field::UserId, format!("from user {}", con.user_id), con);
+    let exe = Op::simple(operand::PROCESS_PATH, &con.process_path);
+    // Without a command line the executable is the best that can be matched.
+    let command = if con.process_args.first().is_none_or(String::is_empty) {
+        exe.clone()
+    } else {
+        Op::simple(operand::PROCESS_COMMAND, command_line(con))
+    };
+    let mut exe_target = target(Field::ProcPath, "from this executable", exe);
+    exe_target.enabled = con.process_id != UNKNOWN;
+    let mut uid = target(
+        Field::UserId,
+        format!("from user {}", con.user_id),
+        Op::simple(operand::USER_ID, con.user_id.to_string()),
+    );
     uid.enabled = con.user_id != UNKNOWN;
     vec![
-        exe,
-        target(Field::ProcArgs, "from this command line".into(), con),
-        target(Field::DstPort, format!("to port {}", con.dst_port), con),
-        target(Field::DstIp, format!("to {}", con.dst_ip), con),
+        exe_target,
+        target(Field::ProcArgs, "from this command line", command),
+        target(
+            Field::DstPort,
+            format!("to port {}", con.dst_port),
+            Op::simple(operand::DEST_PORT, con.dst_port.to_string()),
+        ),
+        target(
+            Field::DstIp,
+            format!("to {}", con.dst_ip),
+            Op::simple(operand::DEST_IP, &con.dst_ip),
+        ),
         uid,
-        target(Field::ProcId, "from this PID".into(), con),
+        target(
+            Field::ProcId,
+            "from this PID",
+            Op::simple(operand::PROCESS_ID, con.process_id.to_string()),
+        ),
     ]
 }
 
@@ -245,36 +234,55 @@ fn mask_v6(ip: Ipv6Addr, prefix: u32) -> Ipv6Addr {
 fn network_targets(con: &Connection) -> Vec<Target> {
     let mut out = Vec::new();
     if let Some(alias) = network_alias(&con.dst_ip) {
-        out.push(target(Field::DstNetwork, format!("to {alias}"), con));
+        out.push(target(
+            Field::DstNetwork,
+            format!("to {alias}"),
+            network_op(alias),
+        ));
     }
-    let prefixes: &[u32] = match con.dst_ip.parse::<IpAddr>() {
-        Ok(IpAddr::V4(_)) => &[24, 16, 8],
-        Ok(IpAddr::V6(_)) => &[64, 128],
-        Err(_) => &[],
+    let ip = con.dst_ip.parse::<IpAddr>().ok();
+    let prefixes: &[u32] = match ip {
+        Some(IpAddr::V4(_)) => &[24, 16, 8],
+        Some(IpAddr::V6(_)) => &[64, 128],
+        None => &[],
     };
     for &prefix in prefixes {
-        let net = match con.dst_ip.parse::<IpAddr>() {
-            Ok(IpAddr::V4(ip)) => mask_v4(ip, prefix).to_string(),
-            Ok(IpAddr::V6(ip)) => mask_v6(ip, prefix).to_string(),
-            Err(_) => continue,
+        let net = match ip {
+            Some(IpAddr::V4(ip)) => mask_v4(ip, prefix).to_string(),
+            Some(IpAddr::V6(ip)) => mask_v6(ip, prefix).to_string(),
+            None => continue,
         };
-        out.push(target(Field::DstNetwork, format!("to {net}/{prefix}"), con));
+        out.push(target(
+            Field::DstNetwork,
+            format!("to {net}/{prefix}"),
+            network_op(format!("{net}/{prefix}")),
+        ));
     }
     out
 }
 
 /// Host entry plus one wildcard entry per parent domain (down to two labels).
+///
+/// Host names come from DNS answers, so they are untrusted: the wildcard
+/// regexps are built from the escaped name.
 fn host_targets(con: &Connection) -> Vec<Target> {
     if con.dst_host.is_empty() || con.dst_host == con.dst_ip {
         return Vec::new();
     }
-    let mut out = vec![target(Field::DstHost, con.dst_host.clone(), con)];
+    let mut out = vec![target(
+        Field::DstHost,
+        &con.dst_host,
+        Op::simple(operand::DEST_HOST, &con.dst_host),
+    )];
     let parts: Vec<&str> = con.dst_host.split('.').skip(1).collect();
     for i in 0..parts.len().saturating_sub(1) {
+        let domain = parts[i..].join(".");
+        // "to *.yahoo.com" -> ^(|.*\.)yahoo\.com$
+        let data = format!("^(|.*\\.){}$", regex_escape(&domain));
         out.push(target(
             Field::RegexHost,
-            format!("to *.{}", parts[i..].join(".")),
-            con,
+            format!("to *.{domain}"),
+            regexp_op(operand::DEST_HOST, data),
         ));
     }
     out
@@ -285,29 +293,79 @@ fn ip_regexp_targets(con: &Connection) -> Vec<Target> {
     let parts: Vec<&str> = con.dst_ip.split('.').collect();
     (1..parts.len())
         .map(|i| {
+            let prefix = parts[..i].join(".");
+            // "to 1.2.*" -> 1\.2\..*
+            let data = format!("{}.*", regex_escape(&format!("{prefix}.")));
             target(
                 Field::RegexIp,
-                format!("to {}.*", parts[..i].join(".")),
-                con,
+                format!("to {prefix}.*"),
+                regexp_op(operand::DEST_IP, data),
             )
         })
         .collect()
 }
 
+/// The AppImage pattern for `/tmp/.mount_<6 chars><suffix>/.../<bin>`.
+///
+/// Anyone can create such a directory, so the pattern is only offered when the
+/// mount name has the shape AppImage creates, and every part of it is escaped.
+/// The pattern then matches that program's mounts and nothing broader.
+fn appimage_target(con: &Connection) -> Option<Target> {
+    let rest = con.process_path.strip_prefix(APPIMAGE_PREFIX)?;
+    let (mount, inner) = rest.split_once('/')?;
+    // 6 characters of the app's name, then a random alphanumeric suffix.
+    let split = mount.char_indices().nth(6).map(|(i, _)| i)?;
+    let (head, tail) = mount.split_at(split);
+    let bin = inner.rsplit('/').next().filter(|b| !b.is_empty())?;
+    let head_ok = head
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'));
+    if !head_ok || !tail.chars().all(|c| c.is_ascii_alphanumeric()) {
+        return None;
+    }
+    let data = format!(
+        "^{}{}[0-9A-Za-z]+/(.*/)?{}$",
+        regex_escape(APPIMAGE_PREFIX),
+        regex_escape(head),
+        regex_escape(bin)
+    );
+    Some(target(
+        Field::AppImage,
+        format!("from {APPIMAGE_PREFIX}{head}*/{bin}"),
+        regexp_op(operand::PROCESS_PATH, data),
+    ))
+}
+
+/// The snap pattern for `/snap/<name>/<revision>/...`, with the revision as a wildcard.
+///
+/// Only offered for a valid snap name and a numeric revision; every part is escaped.
+fn snap_target(con: &Connection) -> Option<Target> {
+    let rest = con.process_path.strip_prefix("/snap/")?;
+    let mut parts = rest.split('/');
+    let (app, revision) = (parts.next()?, parts.next()?);
+    let inner: Vec<&str> = parts.collect();
+    let app_ok = !app.is_empty()
+        && app
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_'));
+    let revision_ok = !revision.is_empty() && revision.chars().all(|c| c.is_ascii_digit());
+    if !app_ok || !revision_ok || inner.is_empty() || inner.iter().any(|c| c.is_empty()) {
+        return None;
+    }
+    let escaped: Vec<String> = inner.iter().map(|c| regex_escape(c)).collect();
+    let data = format!("^/snap/{}/[0-9]+/{}$", regex_escape(app), escaped.join("/"));
+    Some(target(
+        Field::Snap,
+        format!("from /snap/{app}/*/{}", inner.join("/")),
+        regexp_op(operand::PROCESS_PATH, data),
+    ))
+}
+
 /// Entries of the main "apply to" combo.
 pub fn what_targets(con: &Connection) -> Vec<Target> {
     let mut out = fixed_targets(con);
-    if con.process_path.starts_with(APPIMAGE_PREFIX) {
-        let (dir, bin) = split_path(&con.process_path);
-        let dir: String = dir.chars().take(APPIMAGE_PREFIX.len() + 6).collect();
-        out.push(target(Field::AppImage, format!("from {dir}*/{bin}"), con));
-    } else if con.process_path.starts_with(SNAP_PREFIX) {
-        let parts: Vec<&str> = con.process_path.split('/').collect();
-        if parts.len() > 4 {
-            let label = format!("from {SNAP_PREFIX}/{}/*/{}", parts[2], parts[4..].join("/"));
-            out.push(target(Field::Snap, label, con));
-        }
-    }
+    out.extend(appimage_target(con));
+    out.extend(snap_target(con));
     out.extend(network_targets(con));
     out.extend(host_targets(con));
     out.extend(ip_regexp_targets(con));
@@ -317,7 +375,11 @@ pub fn what_targets(con: &Connection) -> Vec<Target> {
 /// Entries of the "destination IP" combo shown in the advanced view.
 pub fn ip_targets(con: &Connection) -> Vec<Target> {
     let mut out = host_targets(con);
-    out.push(target(Field::DstIp, format!("to {}", con.dst_ip), con));
+    out.push(target(
+        Field::DstIp,
+        format!("to {}", con.dst_ip),
+        Op::simple(operand::DEST_IP, &con.dst_ip),
+    ));
     out.extend(ip_regexp_targets(con));
     out.extend(network_targets(con));
     out
@@ -326,14 +388,8 @@ pub fn ip_targets(con: &Connection) -> Vec<Target> {
 /// Index of the entry to preselect, following the Qt UI's `set_default_target`.
 pub fn default_target_index(targets: &[Target], con: &Connection, saved: usize) -> usize {
     let find = |field: Field| targets.iter().position(|t| t.field == field);
-    let packaged = if con.process_path.starts_with(APPIMAGE_PREFIX) {
-        find(Field::AppImage)
-    } else if con.process_path.starts_with(SNAP_PREFIX) {
-        find(Field::Snap)
-    } else {
-        None
-    };
-    if let Some(idx) = packaged {
+    // These patterns are only in the list when the path has the expected shape.
+    if let Some(idx) = find(Field::AppImage).or_else(|| find(Field::Snap)) {
         return idx;
     }
     let known_pid = con.process_id > 0 && con.process_id != UNKNOWN;
@@ -441,16 +497,157 @@ mod tests {
         let idx = default_target_index(&t, &c, 0);
         assert_eq!(t[idx].field, Field::AppImage);
         assert_eq!(t[idx].label, "from /tmp/.mount_fooAbC*/foo");
-        assert_eq!(t[idx].op.data, r"^/tmp/\.mount_fooAbC[0-9A-Za-z]+\/.*foo$");
+        assert_eq!(
+            t[idx].op.data,
+            r"^/tmp/\.mount_fooAbC[0-9A-Za-z]+/(.*/)?foo$"
+        );
 
         c.process_path = "/snap/firefox/123/usr/lib/firefox".into();
         let t = what_targets(&c);
         let idx = default_target_index(&t, &c, 0);
         assert_eq!(t[idx].label, "from /snap/firefox/*/usr/lib/firefox");
+        assert_eq!(t[idx].op.data, r"^/snap/firefox/[0-9]+/usr/lib/firefox$");
+    }
+
+    /// What is left of a regexp once every escaped character is removed, to look
+    /// for operators (like `|`) that would change what it matches.
+    fn unescaped(regexp: &str) -> String {
+        let mut out = String::new();
+        let mut chars = regexp.chars();
+        while let Some(ch) = chars.next() {
+            if ch == '\\' {
+                chars.next();
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    fn target_of(targets: &[Target], field: Field) -> Option<&Target> {
+        targets.iter().find(|t| t.field == field)
+    }
+
+    #[test]
+    fn regex_escape_escapes_every_metacharacter() {
+        for ch in "\\.+*?()|[]{}^$".chars() {
+            assert_eq!(regex_escape(&ch.to_string()), format!("\\{ch}"));
+        }
         assert_eq!(
-            t[idx].op.data,
-            r"^\/snap\/firefox\/[0-9]+\/usr\/lib\/firefox$"
+            regex_escape("plain-text_1/\u{e9} x"),
+            "plain-text_1/\u{e9} x"
         );
+    }
+
+    /// The attack that motivated escaping. A program named `x|.*` in a directory
+    /// that looks like an AppImage mount used to give a rule ending in `|.*$`,
+    /// which matches every path, and AppImage is the default selection.
+    #[test]
+    fn hostile_appimage_name_cannot_widen_the_rule() {
+        let mut c = con();
+        c.process_path = "/tmp/.mount_abcdef1/usr/bin/x|.*".into();
+        let t = what_targets(&c);
+        let appimage = target_of(&t, Field::AppImage).expect("the pattern is offered");
+        assert_eq!(
+            appimage.op.data,
+            r"^/tmp/\.mount_abcdef[0-9A-Za-z]+/(.*/)?x\|\.\*$"
+        );
+        assert!(
+            !unescaped(&appimage.op.data).contains('|'),
+            "no alternation"
+        );
+        assert!(!unescaped(&appimage.op.data).contains("x.*"), "no wildcard");
+    }
+
+    #[test]
+    fn appimage_pattern_needs_the_shape_appimage_creates() {
+        let offered = |path: &str| {
+            let mut c = con();
+            c.process_path = path.into();
+            target_of(&what_targets(&c), Field::AppImage).is_some()
+        };
+        assert!(offered("/tmp/.mount_abcdef1/usr/bin/x"));
+        assert!(offered("/tmp/.mount_Cur-or1A2b3c/x"));
+        assert!(
+            !offered("/tmp/.mount_ab|.*f1/usr/bin/x"),
+            "regexp in the name"
+        );
+        assert!(!offered("/tmp/.mount_abc(de1/bin/x"), "parenthesis");
+        assert!(
+            !offered("/tmp/.mount_Joplin-xAbcde/bin/x"),
+            "suffix not alphanumeric"
+        );
+        assert!(!offered("/tmp/.mount_abcdef/bin/x"), "no random suffix");
+        assert!(!offered("/tmp/.mount_abcdef1/"), "no program");
+        assert!(!offered("/tmp/.mount_abcdef1"), "no inner path");
+    }
+
+    #[test]
+    fn hostile_mount_name_defaults_to_the_executable() {
+        let mut c = con();
+        c.process_path = "/tmp/.mount_a|.*bcd1/usr/bin/x".into();
+        let t = what_targets(&c);
+        assert!(target_of(&t, Field::AppImage).is_none());
+        let idx = default_target_index(&t, &c, 0);
+        assert_eq!(t[idx].field, Field::ProcPath);
+    }
+
+    #[test]
+    fn snap_pattern_needs_a_valid_name_and_revision() {
+        let offered = |path: &str| {
+            let mut c = con();
+            c.process_path = path.into();
+            target_of(&what_targets(&c), Field::Snap).is_some()
+        };
+        assert!(offered("/snap/firefox/4793/usr/lib/firefox/firefox"));
+        assert!(!offered("/snap/ab|c/1/usr/bin/x"), "regexp in the name");
+        assert!(
+            !offered("/snap/firefox/current/usr/bin/x"),
+            "revision not a number"
+        );
+        assert!(!offered("/snap/firefox/12"), "no program");
+        assert!(
+            !offered("/snapx/firefox/12/bin/x"),
+            "not the /snap directory"
+        );
+        assert!(!offered("/snap/firefox/12//x"), "empty path component");
+    }
+
+    #[test]
+    fn snap_program_names_are_escaped() {
+        let mut c = con();
+        c.process_path = "/snap/app/12/bin/a|b".into();
+        let t = what_targets(&c);
+        let snap = target_of(&t, Field::Snap).expect("offered");
+        assert_eq!(snap.op.data, r"^/snap/app/[0-9]+/bin/a\|b$");
+    }
+
+    /// Host names come from DNS answers. This one has a space and regexp
+    /// syntax. The rule used to be built from the last word of the label, which
+    /// here is only a fragment of the name.
+    #[test]
+    fn hostile_host_name_is_escaped_in_the_wildcard_rule() {
+        let mut c = con();
+        c.dst_host = "www.a b.c|d".into();
+        let t = what_targets(&c);
+        let wildcard = target_of(&t, Field::RegexHost).expect("offered");
+        assert_eq!(wildcard.label, "to *.a b.c|d");
+        assert_eq!(wildcard.op.data, r"^(|.*\.)a b\.c\|d$");
+        let exact = target_of(&t, Field::DstHost).expect("offered");
+        assert_eq!(
+            exact.op.data, "www.a b.c|d",
+            "the exact rule keeps the raw name"
+        );
+    }
+
+    #[test]
+    fn labels_drop_control_characters_but_operators_keep_the_exact_text() {
+        let mut c = con();
+        c.dst_host = "a\nb.example.com".into();
+        let t = what_targets(&c);
+        let host = target_of(&t, Field::DstHost).expect("offered");
+        assert!(!host.label.contains('\n'));
+        assert_eq!(host.op.data, "a\nb.example.com");
     }
 
     #[test]

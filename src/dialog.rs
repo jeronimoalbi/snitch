@@ -74,14 +74,11 @@ fn desktop_info(path: &str) -> Option<gtk::gio::AppInfo> {
         return None;
     }
     let wanted = Path::new(path);
-    let apps = gtk::gio::AppInfo::all();
-    apps.iter()
-        .find(|a| a.executable() == wanted)
-        .or_else(|| {
-            apps.iter()
-                .find(|a| a.executable().file_name() == wanted.file_name())
-        })
-        .cloned()
+    // Matching by name alone would let any program called `firefox` borrow
+    // Firefox's name and icon; see `view::same_program`.
+    gtk::gio::AppInfo::all()
+        .into_iter()
+        .find(|app| view::same_program(&app.executable(), wanted))
 }
 
 fn label(text: &str) -> gtk::Label {

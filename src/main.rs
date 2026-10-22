@@ -42,6 +42,7 @@ OPTIONS:
     --demo-scenario <NAME>   Demo scenario (implies --demo); default: curl
     --socket <ADDRESS>       Address to listen on (default: the Qt UI setting, else unix:///tmp/osui.sock)
     --settings <PATH>        Qt UI settings file (default: ~/.config/opensnitch/settings.conf)
+    --allow-uid <UID>        Let this user, besides root, act as the daemon (repeatable)
     -h, --help               Show this help";
 
 /// Parsed command line.
@@ -50,6 +51,8 @@ struct Args {
     demo: Option<String>,
     socket: Option<String>,
     settings: Option<PathBuf>,
+    /// User ids, besides root, that may act as the daemon.
+    allow_uids: Vec<u32>,
 }
 
 fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, String> {
@@ -73,6 +76,13 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, St
             }
             "--socket" => out.socket = Some(value("--socket")?),
             "--settings" => out.settings = Some(PathBuf::from(value("--settings")?)),
+            "--allow-uid" => {
+                let uid = value("--allow-uid")?;
+                let uid = uid
+                    .parse()
+                    .map_err(|_| format!("--allow-uid needs a user id, not '{uid}'"))?;
+                out.allow_uids.push(uid);
+            }
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
@@ -106,7 +116,12 @@ fn main() -> glib::ExitCode {
         let settings_path = args.settings.clone().unwrap_or_else(Settings::default_path);
         match &args.demo {
             Some(name) => run_demo(app, name, &settings_path),
-            None => run_daemon(app, args.socket.clone(), settings_path),
+            None => run_daemon(
+                app,
+                args.socket.clone(),
+                settings_path,
+                args.allow_uids.clone(),
+            ),
         }
     });
     app.run_with_args::<String>(&[])
@@ -140,7 +155,12 @@ fn run_demo(app: &adw::Application, scenario: &str, settings_path: &std::path::P
 }
 
 /// Starts the gRPC server and shows a dialog for every `AskRule` it receives.
-fn run_daemon(app: &adw::Application, socket: Option<String>, settings_path: PathBuf) {
+fn run_daemon(
+    app: &adw::Application,
+    socket: Option<String>,
+    settings_path: PathBuf,
+    allow_uids: Vec<u32>,
+) {
     let address = socket
         .or_else(|| Settings::load(&settings_path).server_address)
         .unwrap_or_else(|| DEFAULT_ADDRESS.to_string());
@@ -170,7 +190,7 @@ fn run_daemon(app: &adw::Application, socket: Option<String>, settings_path: Pat
         };
         let outcome = runtime.block_on(async {
             tokio::select! {
-                result = server::serve(&serve_address, service) => result,
+                result = server::serve(&serve_address, service, &allow_uids) => result,
                 () = server::shutdown_signal() => Ok(()),
             }
         });
@@ -299,6 +319,18 @@ mod tests {
             Some("curl")
         );
         assert!(parse(&["--help"]).unwrap().is_none());
+    }
+
+    #[test]
+    fn allow_uid_can_be_repeated() {
+        let a = parse(&["--allow-uid", "1000", "--allow-uid", "0"])
+            .unwrap()
+            .unwrap();
+        assert_eq!(a.allow_uids, [1000, 0]);
+        assert!(parse(&["--allow-uid", "me"]).is_err());
+        assert!(parse(&["--allow-uid"]).is_err());
+        assert!(parse(&["--allow-uid", "-1"]).is_err());
+        assert!(parse(&[]).unwrap().unwrap().allow_uids.is_empty());
     }
 
     #[test]

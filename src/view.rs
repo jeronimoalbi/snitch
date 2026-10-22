@@ -3,6 +3,8 @@
 //! be unit tested. Connection data is attacker-controlled, so everything that
 //! ends up in Pango markup goes through [`escape_markup`].
 
+use std::path::{Component, Path};
+
 use crate::model::command_line;
 use crate::proto::{Connection, Rule};
 
@@ -109,6 +111,30 @@ pub fn connection_summary(con: &Connection) -> String {
         printable(program),
         printable(&con.protocol)
     )
+}
+
+/// Directories only root can write to. A program installed there is what its
+/// name says, which a program in a world-writable place like `/tmp` is not.
+const SYSTEM_DIRS: [&str; 7] = ["/usr", "/opt", "/bin", "/sbin", "/lib", "/lib64", "/snap"];
+
+/// True when `path` is absolute, has no `..`, and is inside a system directory.
+pub fn in_system_dir(path: &Path) -> bool {
+    path.is_absolute()
+        && !path.components().any(|c| matches!(c, Component::ParentDir))
+        && SYSTEM_DIRS.iter().any(|dir| path.starts_with(dir))
+}
+
+/// Whether a desktop entry that launches `exec` is the program at `process`.
+///
+/// `Exec=` usually holds only a name (`firefox`), so a program is matched by
+/// name only when it sits in a system directory. A binary called `firefox` in
+/// `/tmp` or the home directory must not borrow Firefox's name, icon and
+/// description, which is what the user trusts when answering.
+pub fn same_program(exec: &Path, process: &Path) -> bool {
+    exec == process
+        || (in_system_dir(process)
+            && exec.file_name().is_some()
+            && exec.file_name() == process.file_name())
 }
 
 /// Application name: desktop entry name, else the binary name.
@@ -325,6 +351,36 @@ mod tests {
         let mut c = con();
         c.process_path = "/tmp/x\nINFO answered allow always".into();
         assert!(!connection_summary(&c).contains('\n'));
+    }
+
+    #[test]
+    fn system_directories_are_recognised() {
+        let system = |p: &str| in_system_dir(Path::new(p));
+        assert!(system("/usr/bin/firefox"));
+        assert!(system("/usr/lib/firefox/firefox"));
+        assert!(system("/opt/google/chrome/chrome"));
+        assert!(system("/snap/firefox/4793/usr/lib/firefox/firefox"));
+        assert!(!system("/tmp/evil/firefox"));
+        assert!(!system("/home/user/bin/firefox"));
+        assert!(!system("/dev/shm/firefox"));
+        assert!(!system("/usrx/bin/firefox"), "only whole directory names");
+        assert!(!system("/usr/../tmp/evil/firefox"), "no parent components");
+        assert!(!system("usr/bin/firefox"), "relative");
+    }
+
+    #[test]
+    fn a_program_borrows_a_desktop_entry_only_from_a_system_directory() {
+        let same = |exec: &str, process: &str| same_program(Path::new(exec), Path::new(process));
+        // `Exec=firefox` is just a name.
+        assert!(same("firefox", "/usr/lib/firefox/firefox"));
+        assert!(same("firefox", "/usr/bin/firefox"));
+        assert!(!same("firefox", "/tmp/evil/firefox"));
+        assert!(!same("firefox", "/home/user/.cache/firefox"));
+        assert!(!same("chrome", "/usr/bin/firefox"));
+        // An entry that names the exact binary matches it wherever it is.
+        assert!(same("/opt/app/bin/app", "/opt/app/bin/app"));
+        assert!(same("/home/user/app/app", "/home/user/app/app"));
+        assert!(!same("", "/usr/bin/firefox"));
     }
 
     #[test]

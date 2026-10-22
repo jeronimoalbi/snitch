@@ -5,7 +5,7 @@
 //! never reach the daemon as gRPC errors: they become a one-shot rule with the
 //! saved default action instead.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -13,11 +13,13 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use tokio::net::unix::UCred;
 use tokio::net::{TcpListener, UnixListener, UnixStream};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::Stream;
 use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream, UnixListenerStream};
 use tonic::transport::Server;
+use tonic::transport::server::UdsConnectInfo;
 use tonic::{Request, Response, Status, Streaming};
 
 use crate::checksum::{self, Mismatch};
@@ -30,6 +32,73 @@ use crate::proto::{
 use crate::rule;
 use crate::settings::Settings;
 use crate::view;
+
+/// Which connecting processes may act as the daemon.
+///
+/// Only root by default. The daemon runs as root, and anything else that can
+/// reach the socket could spam prompts, feed fake rules or take over the
+/// notification stream. Unix sockets tell who is connecting; TCP cannot.
+pub struct PeerPolicy {
+    allowed: Vec<u32>,
+    /// Peers already reported, so a flood of calls logs one line.
+    reported: Mutex<HashSet<(u32, Option<i32>)>>,
+}
+
+/// The most distinct rejected peers that are logged.
+const MAX_REPORTED: usize = 64;
+
+impl PeerPolicy {
+    /// Root plus the `extra` user ids.
+    pub fn new(extra: &[u32]) -> Self {
+        let mut allowed = vec![0];
+        allowed.extend_from_slice(extra);
+        Self {
+            allowed,
+            reported: Mutex::new(HashSet::new()),
+        }
+    }
+
+    /// True when processes of user `uid` may act as the daemon.
+    pub fn allows(&self, uid: u32) -> bool {
+        self.allowed.contains(&uid)
+    }
+
+    /// `Ok` when `request` may be served.
+    pub fn check<T>(&self, request: &Request<T>) -> Result<(), Status> {
+        // No Unix credentials means a TCP connection, which can't be checked.
+        let Some(info) = request.extensions().get::<UdsConnectInfo>() else {
+            return Ok(());
+        };
+        match info.peer_cred {
+            Some(cred) if self.allows(cred.uid()) => Ok(()),
+            cred => {
+                self.report(cred);
+                Err(Status::permission_denied(
+                    "only the OpenSnitch daemon may use this UI",
+                ))
+            }
+        }
+    }
+
+    fn report(&self, cred: Option<UCred>) {
+        let key = cred.map_or((u32::MAX, None), |c| (c.uid(), c.pid()));
+        let first = self
+            .reported
+            .lock()
+            .is_ok_and(|mut seen| seen.len() < MAX_REPORTED && seen.insert(key));
+        if first {
+            match cred {
+                Some(c) => tracing::warn!(
+                    "refused a connection from uid {} (pid {:?}): only uid(s) {:?} may act as the daemon",
+                    c.uid(),
+                    c.pid(),
+                    self.allowed
+                ),
+                None => tracing::warn!("refused a connection whose owner could not be determined"),
+            }
+        }
+    }
+}
 
 /// Error type used for startup failures.
 pub type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -294,9 +363,22 @@ pub async fn shutdown_signal() {
 }
 
 /// Serves `service` on `address` until the process ends or an error occurs.
-pub async fn serve(address: &str, service: Service) -> Result<(), BoxError> {
-    let server = Server::builder().add_service(UiServer::new(service));
-    tracing::info!("listening on {address}");
+///
+/// Only root and the `allowed_uids` may call it (see [`PeerPolicy`]).
+pub async fn serve(address: &str, service: Service, allowed_uids: &[u32]) -> Result<(), BoxError> {
+    let policy = Arc::new(PeerPolicy::new(allowed_uids));
+    let guarded = UiServer::with_interceptor(service, move |request: Request<()>| {
+        policy.check(&request)?;
+        Ok(request)
+    });
+    let server = Server::builder().add_service(guarded);
+    if allowed_uids.is_empty() {
+        tracing::info!("listening on {address}; only root may act as the daemon");
+    } else {
+        tracing::info!(
+            "listening on {address}; only root and uid(s) {allowed_uids:?} may act as the daemon"
+        );
+    }
     match parse_address(address) {
         Listen::Unix(path) => {
             let listener = bind_unix(&path).await?;
@@ -311,6 +393,9 @@ pub async fn serve(address: &str, service: Service) -> Result<(), BoxError> {
                 .await?;
         }
         Listen::Tcp(addr) => {
+            tracing::warn!(
+                "listening on TCP: connecting processes can't be identified, so any local process can act as the daemon"
+            );
             let addr: SocketAddr = addr.parse()?;
             let listener = TcpListener::bind(addr).await?;
             server
@@ -629,5 +714,156 @@ mod tests {
 
         assert_eq!(outcome, Ok(()));
         assert_eq!(reply, [0, 0, 0, 0, 2, 0x08, 0x07], "PingReply with id 7");
+    }
+
+    /// Raw HTTP/2 bytes for a `Ping` call with id 7.
+    fn ping_request() -> Vec<u8> {
+        let mut headers = vec![0x83, 0x86];
+        headers.extend([0x04, 17]);
+        headers.extend(b"/protocol.UI/Ping");
+        headers.extend([0x01, 9]);
+        headers.extend(b"localhost");
+        headers.extend(literal("content-type", "application/grpc"));
+        headers.extend(literal("te", "trailers"));
+        let message = [0, 0, 0, 0, 2, 0x08, 0x07];
+
+        let mut request = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n".to_vec();
+        request.extend(frame(0x4, 0, 0, &[]));
+        request.extend(frame(0x1, 0x4, 1, &headers));
+        request.extend(frame(0x0, 0x1, 1, &message));
+        request
+    }
+
+    /// How the server treated a call.
+    #[derive(Debug, PartialEq, Eq)]
+    enum Served {
+        /// A reply with a body.
+        Reply,
+        /// An error answered with headers only, as gRPC does.
+        Refused,
+    }
+
+    /// Sends `Ping` over `conn` and tells whether it was served or refused.
+    async fn ping_outcome<S>(conn: &mut S) -> Result<Served, String>
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        conn.write_all(&ping_request()).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let mut head = [0u8; 9];
+                conn.read_exact(&mut head)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let len =
+                    usize::try_from(u32::from_be_bytes([0, head[0], head[1], head[2]])).unwrap();
+                let mut payload = vec![0u8; len];
+                conn.read_exact(&mut payload)
+                    .await
+                    .map_err(|e| e.to_string())?;
+                let (kind, flags) = (head[3], head[4]);
+                let stream = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
+                match (kind, stream) {
+                    (0x0, 1) => return Ok(Served::Reply),
+                    (0x1, 1) if flags & 0x1 != 0 => return Ok(Served::Refused),
+                    (0x3, 1) => return Err(format!("stream reset {payload:?}")),
+                    (0x7, _) => return Err(format!("GOAWAY {payload:?}")),
+                    _ => {}
+                }
+            }
+        })
+        .await
+        .map_err(|_| "no answer within 5 seconds".to_string())?
+    }
+
+    /// Serves on `address` in the background and connects to the unix `path`.
+    async fn serve_and_connect(
+        address: String,
+        path: &std::path::Path,
+        allowed: Vec<u32>,
+    ) -> (tokio::task::JoinHandle<()>, tokio::net::UnixStream) {
+        let (tx, _rx) = async_channel::unbounded::<PromptRequest>();
+        let service = Service::new(tx, PathBuf::from("/nonexistent/settings.conf"));
+        let server = tokio::spawn(async move {
+            let _ = serve(&address, service, &allowed).await;
+        });
+        for _ in 0..100 {
+            if let Ok(conn) = UnixStream::connect(path).await {
+                return (server, conn);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the server never started listening on {}", path.display());
+    }
+
+    #[test]
+    fn the_policy_allows_root_and_the_listed_users_only() {
+        let policy = PeerPolicy::new(&[1000]);
+        assert!(policy.allows(0));
+        assert!(policy.allows(1000));
+        assert!(!policy.allows(1001));
+        assert!(!PeerPolicy::new(&[]).allows(1000));
+    }
+
+    /// The daemon is root. A process of the user who runs snitch can open the
+    /// socket (it is 0600) but must not be taken for the daemon.
+    #[tokio::test]
+    async fn a_non_root_process_is_refused_on_a_unix_socket() {
+        use std::os::unix::fs::MetadataExt;
+
+        let own_uid = std::fs::metadata("/proc/self").unwrap().uid();
+        for allowed in [vec![], vec![own_uid]] {
+            let path = std::env::temp_dir().join(format!(
+                "snitch-peer-{}-{}.sock",
+                std::process::id(),
+                allowed.len()
+            ));
+            let (server, mut conn) =
+                serve_and_connect(format!("unix:{}", path.display()), &path, allowed.clone()).await;
+            let outcome = ping_outcome(&mut conn).await;
+            server.abort();
+            let _ = std::fs::remove_file(&path);
+
+            // Running the tests as root makes the first case legitimate.
+            let expect = if allowed.is_empty() && own_uid != 0 {
+                Served::Refused
+            } else {
+                Served::Reply
+            };
+            assert_eq!(
+                outcome,
+                Ok(expect),
+                "allowed uids {allowed:?}, running as {own_uid}"
+            );
+        }
+    }
+
+    /// TCP carries no process identity, so it is still served (with a warning).
+    #[tokio::test]
+    async fn tcp_connections_are_still_served() {
+        let port = {
+            let probe = TcpListener::bind("127.0.0.1:0").await.unwrap();
+            probe.local_addr().unwrap().port()
+        };
+        let (tx, _rx) = async_channel::unbounded::<PromptRequest>();
+        let service = Service::new(tx, PathBuf::from("/nonexistent/settings.conf"));
+        let address = format!("127.0.0.1:{port}");
+        let server = tokio::spawn(async move {
+            let _ = serve(&address, service, &[]).await;
+        });
+        let mut conn = None;
+        for _ in 0..100 {
+            if let Ok(c) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                conn = Some(c);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let mut conn = conn.expect("the server never started listening");
+        let outcome = ping_outcome(&mut conn).await;
+        server.abort();
+        assert_eq!(outcome, Ok(Served::Reply));
     }
 }
