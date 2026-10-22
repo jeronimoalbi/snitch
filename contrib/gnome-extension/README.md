@@ -25,7 +25,7 @@ must be running. The extension does not talk to the OpenSnitch daemon itself.
 
 ## Install
 
-You need a snitch newer than 0.9.0 (one that offers the D-Bus service) and GNOME
+You need snitch 0.9.0 or newer (the first with the D-Bus service) and GNOME
 Shell 51. Other versions may work, but they have not been tried; add them
 to `shell-version` in `metadata.json` once you have.
 
