@@ -17,7 +17,7 @@ import * as Main from 'resource:///org/gnome/shell/ui/main.js';
 import * as PanelMenu from 'resource:///org/gnome/shell/ui/panelMenu.js';
 import * as PopupMenu from 'resource:///org/gnome/shell/ui/popupMenu.js';
 
-import { loadSettings, saveSetting } from './settings.js';
+import { loadKeepOnTop, loadSettings, saveKeepOnTop, saveSetting } from './settings.js';
 
 Gio._promisify(Gio.DBusConnection.prototype, 'call', 'call_finish');
 
@@ -41,6 +41,8 @@ const INTERFACE_XML = `
 const SnitchProxy = Gio.DBusProxy.makeProxyWrapper(INTERFACE_XML);
 
 const UNIT = 'snitch.service';
+// Snitch's windows have its application id as their window class.
+const WINDOW_CLASS = 'io.github.jeronimoalbi.Snitch';
 
 // What the user's systemd says about the unit's autostart.
 // `on` and `off` can be changed; anything else cannot, and says why.
@@ -203,6 +205,10 @@ const Indicator = GObject.registerClass(
             this._login.connect('toggled', (_item, on) => this._setAutostart(on));
             this._loginNote = new PopupMenu.PopupMenuItem('', { reactive: false });
 
+            this._onTop = loadKeepOnTop();
+            this._onTopSwitch = new PopupMenu.PopupSwitchMenuItem('Keep prompt on top', this._onTop);
+            this._onTopSwitch.connect('toggled', (_item, on) => this._setKeepOnTop(on));
+
             this._prompt = new PopupMenu.PopupSubMenuMenuItem('Prompt defaults');
             this._steppers = {
                 action: new Stepper('Default action', ACTIONS,
@@ -238,6 +244,7 @@ const Indicator = GObject.registerClass(
             menu.addMenuItem(this._firewall);
             menu.addMenuItem(this._login);
             menu.addMenuItem(this._loginNote);
+            menu.addMenuItem(this._onTopSwitch);
             menu.addMenuItem(this._running);
             menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
             menu.addMenuItem(this._prompt);
@@ -250,6 +257,7 @@ const Indicator = GObject.registerClass(
                 }
             });
 
+            this._watchWindows();
             this._connectProxy();
             this._sync();
             this._readAutostart();
@@ -263,6 +271,51 @@ const Indicator = GObject.registerClass(
             const proxy = this._proxy;
             const path = proxy && proxy.g_name_owner ? proxy.SettingsPath : null;
             return typeof path === 'string' && path !== '' ? path : null;
+        }
+
+        // The compositor lets no application stay on top by itself, but the
+        // shell can do it for the application's windows.
+        _watchWindows() {
+            this._displayId = global.display.connect('window-created',
+                (_display, window) => this._track(window));
+            for (const actor of global.get_window_actors()) {
+                this._track(actor.meta_window);
+            }
+        }
+
+        // Keeps `window` above the others if it is one of snitch's. The class
+        // may be set after the window appears, so look again when it changes.
+        _track(window) {
+            const apply = () => {
+                if (!this._destroyed && window.get_wm_class() === WINDOW_CLASS) {
+                    this._place(window, this._onTop);
+                }
+            };
+            apply();
+            window.connect('notify::wm-class', apply);
+        }
+
+        _place(window, above) {
+            if (above && !window.is_above()) {
+                window.make_above();
+            } else if (!above && window.is_above()) {
+                window.unmake_above();
+            }
+        }
+
+        _setKeepOnTop(on) {
+            this._onTop = on;
+            try {
+                saveKeepOnTop(on);
+            } catch (error) {
+                Main.notifyError('Snitch', `Cannot save the setting: ${error.message}`);
+            }
+            for (const actor of global.get_window_actors()) {
+                const window = actor.meta_window;
+                if (window.get_wm_class() === WINDOW_CLASS) {
+                    this._place(window, on);
+                }
+            }
         }
 
         async _readPrompt() {
@@ -495,6 +548,10 @@ const Indicator = GObject.registerClass(
         destroy() {
             this._destroyed = true;
             this._clearWanted();
+            if (this._displayId) {
+                global.display.disconnect(this._displayId);
+                this._displayId = 0;
+            }
             if (this._proxy) {
                 for (const id of this._proxyIds) {
                     this._proxy.disconnect(id);

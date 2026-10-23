@@ -188,3 +188,29 @@ export async function saveSetting(name, value, path = settingsPath()) {
     }
     throw new Error('the settings file keeps changing, try again');
 }
+
+// The extension's own preferences, apart from the OpenSnitch file. A plain
+// key file, because a copied extension can't ship a compiled GSettings schema.
+const PREFERENCES = 'snitch/gnome-extension.ini';
+
+function preferencesPath() {
+    return GLib.build_filenamev([GLib.get_user_config_dir(), PREFERENCES]);
+}
+
+// Whether the prompt windows are kept above others; on unless turned off.
+export function loadKeepOnTop(path = preferencesPath()) {
+    const file = new GLib.KeyFile();
+    try {
+        file.load_from_file(path, GLib.KeyFileFlags.NONE);
+        return file.get_boolean('prompt', 'keep_on_top');
+    } catch (error) {
+        return true;
+    }
+}
+
+export function saveKeepOnTop(on, path = preferencesPath()) {
+    const file = new GLib.KeyFile();
+    file.set_boolean('prompt', 'keep_on_top', on);
+    GLib.mkdir_with_parents(GLib.path_get_dirname(path), 0o700);
+    file.save_to_file(path);
+}

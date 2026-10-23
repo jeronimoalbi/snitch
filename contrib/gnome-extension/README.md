@@ -11,6 +11,10 @@ A click opens a menu with:
   Either way, and also when snitch stops by itself, a notification tells you.
   While snitch is stopped nothing asks you: the daemon applies its own default.
 - **Start snitch on login**: enables or disables `snitch.service`.
+- **Keep prompt on top**: on by default. GNOME lets no program stay on top
+  by itself, so the extension does it for snitch's windows. It doesn't take
+  keyboard focus, so it can't catch what you are typing. Saved in
+  `~/.config/snitch/gnome-extension.ini`.
 - **Prompt defaults**: action, duration, what to apply to, time to answer and
   the advanced checks, as in the Qt preferences.
 
