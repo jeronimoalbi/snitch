@@ -22,6 +22,7 @@ export const OPTIONS = {
     duration: { key: 'default_duration', fallback: 6, kind: 'number', max: 8 },
     target: { key: 'default_target', fallback: 0, kind: 'number', max: 5 },
     timeout: { key: 'default_timeout', fallback: 30, kind: 'number' },
+    position: { key: 'default_popup_position', fallback: 0, kind: 'number', max: 4 },
     advanced: { key: 'default_popup_advanced', fallback: false, kind: 'flag' },
     dstIp: { key: 'default_popup_advanced_dstip', fallback: false, kind: 'flag' },
     dstPort: { key: 'default_popup_advanced_dstport', fallback: false, kind: 'flag' },

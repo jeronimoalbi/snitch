@@ -92,8 +92,8 @@ there is nothing to restart. Edit it, use the Qt preferences, or use the
 - `default_target`: what "Apply to" starts on: `0` program (default), `1`
   command line, `2` port, `3` IP, `4` user, `5` process.
 - `default_popup_position`: `0` centre (default), `1` top right, `2` bottom
-  right, `3` top left, `4` bottom left. Only on compositors with layer-shell
-  (Hyprland, Sway, KDE); GNOME and X11 place the window themselves.
+  right, `3` top left, `4` bottom left. Works on compositors with layer-shell
+  (Hyprland, Sway, KDE) and, on GNOME, through the extension; not on X11.
 
 > **Careful.** A timed-out prompt gets the default action *with the default
 > duration*. "Reject" plus "forever" turns a missed prompt into a permanent

@@ -43,6 +43,8 @@ const SnitchProxy = Gio.DBusProxy.makeProxyWrapper(INTERFACE_XML);
 const UNIT = 'snitch.service';
 // Snitch's windows have its application id as their window class.
 const WINDOW_CLASS = 'io.github.jeronimoalbi.Snitch';
+// The prompt's title; snitch's other windows have another.
+const PROMPT_TITLE = 'OpenSnitch';
 
 // What the user's systemd says about the unit's autostart.
 // `on` and `off` can be changed; anything else cannot, and says why.
@@ -101,6 +103,10 @@ const DURATIONS = ['once', '30 seconds', '5 minutes', '15 minutes', '30 minutes'
 const TARGETS = ['This executable', 'This command line', 'Destination port',
     'Destination IP', 'This user', 'This process']
     .map((label, value) => ({ value, label }));
+const POSITIONS = ['Centre', 'Top right', 'Bottom right', 'Top left', 'Bottom left']
+    .map((label, value) => ({ value, label }));
+// Gap between the prompt and the screen edge, as with layer-shell in snitch.
+const MARGIN = 24;
 const TIMEOUTS = [5, 10, 15, 20, 30, 45, 60, 120]
     .map(value => ({ value, label: `${value} seconds` }));
 
@@ -219,6 +225,8 @@ const Indicator = GObject.registerClass(
                     value => this._savePrompt('target', value)),
                 timeout: new Stepper('Time to answer', TIMEOUTS,
                     value => this._savePrompt('timeout', value)),
+                position: new Stepper('Position', POSITIONS,
+                    value => this._savePrompt('position', value)),
             };
             this._switches = {};
             for (const stepper of Object.values(this._steppers)) {
@@ -279,20 +287,76 @@ const Indicator = GObject.registerClass(
             this._displayId = global.display.connect('window-created',
                 (_display, window) => this._track(window));
             for (const actor of global.get_window_actors()) {
-                this._track(actor.meta_window);
+                this._track(actor.meta_window, true);
             }
         }
 
         // Keeps `window` above the others if it is one of snitch's. The class
         // may be set after the window appears, so look again when it changes.
-        _track(window) {
+        _track(window, existing = false) {
+            let arranged = existing;
             const apply = () => {
-                if (!this._destroyed && window.get_wm_class() === WINDOW_CLASS) {
-                    this._place(window, this._onTop);
+                if (this._destroyed || window.get_wm_class() !== WINDOW_CLASS) {
+                    return;
+                }
+                this._place(window, this._onTop);
+                // Only the prompt (not other snitch windows), and only once,
+                // when it appears: not a window you may be answering already.
+                if (!arranged && window.get_title() === PROMPT_TITLE) {
+                    arranged = true;
+                    this._arrangeWhenDrawn(window);
                 }
             };
             apply();
             window.connect('notify::wm-class', apply);
+            window.connect('notify::title', apply);
+        }
+
+        // The size is known once the first frame is drawn.
+        _arrangeWhenDrawn(window) {
+            const actor = window.get_compositor_private();
+            if (!actor) {
+                GLib.idle_add(GLib.PRIORITY_DEFAULT, () => {
+                    this._moveToCorner(window);
+                    return GLib.SOURCE_REMOVE;
+                });
+                return;
+            }
+            const id = actor.connect('first-frame', () => {
+                actor.disconnect(id);
+                this._moveToCorner(window);
+            });
+        }
+
+        // Puts the prompt where `default_popup_position` says, as the Qt UI
+        // does. A program can't place its own window on Wayland; the shell can.
+        // The position comes only from the file snitch reads.
+        async _moveToCorner(window) {
+            const path = this._settingsPath();
+            if (path === null) {
+                return;
+            }
+            try {
+                const { position } = await loadSettings(path);
+                if (this._destroyed) {
+                    return;
+                }
+                const area = window.get_work_area_current_monitor();
+                const frame = window.get_frame_rect();
+                const right = area.x + area.width - frame.width - MARGIN;
+                const bottom = area.y + area.height - frame.height - MARGIN;
+                const left = area.x + MARGIN;
+                const top = area.y + MARGIN;
+                const [x, y] = [
+                    [area.x + (area.width - frame.width) / 2,
+                        area.y + (area.height - frame.height) / 2],
+                    [right, top], [right, bottom], [left, top], [left, bottom],
+                ][position];
+                window.move_frame(true, Math.round(x), Math.round(y));
+            } catch (error) {
+                // The window may be gone by now; it is not worth a message.
+                console.error(`snitch: cannot place the prompt: ${error.message}`);
+            }
         }
 
         _place(window, above) {

@@ -15,8 +15,10 @@ A click opens a menu with:
   by itself, so the extension does it for snitch's windows. It doesn't take
   keyboard focus, so it can't catch what you are typing. Saved in
   `~/.config/snitch/gnome-extension.ini`.
-- **Prompt defaults**: action, duration, what to apply to, time to answer and
-  the advanced checks, as in the Qt preferences.
+- **Prompt defaults**: action, duration, what to apply to, time to answer,
+  position and the advanced checks, as in the Qt preferences. GNOME lets a
+  program place no window itself, so the extension moves the prompt to the
+  chosen corner when it appears.
 
 ## Install
 
