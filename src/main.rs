@@ -15,7 +15,7 @@ mod settings;
 mod view;
 
 use std::cell::RefCell;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gtk4::gio::ApplicationFlags;
@@ -132,7 +132,7 @@ fn main() -> glib::ExitCode {
 }
 
 /// Shows one fake prompt, prints the resulting rule and exits.
-fn run_demo(app: &adw::Application, scenario: &str, settings_path: &std::path::Path) {
+fn run_demo(app: &adw::Application, scenario: &str, settings_path: &Path) {
     let Some(con) = demo::scenario(scenario) else {
         return;
     };
@@ -158,6 +158,60 @@ fn run_demo(app: &adw::Application, scenario: &str, settings_path: &std::path::P
     });
 }
 
+/// Address to listen on: `--socket`, else the saved one, else the default.
+fn listen_address(socket: Option<String>, settings_path: &Path) -> String {
+    socket
+        .or_else(|| Settings::load(settings_path).server_address)
+        .unwrap_or_else(|| DEFAULT_ADDRESS.to_string())
+}
+
+/// The directory of a unix socket address when it doesn't exist; snitch
+/// doesn't create it.
+fn missing_socket_dir(address: &str) -> Option<PathBuf> {
+    let path = server::socket_path(address)?;
+    let dir = path.parent()?;
+    (!dir.is_dir()).then(|| dir.to_path_buf())
+}
+
+fn start_runtime() -> tokio::runtime::Runtime {
+    match tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            tracing::error!("cannot start the async runtime: {err}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// Serves the daemon on its own thread. The process ends when the server does.
+fn spawn_server(
+    runtime: tokio::runtime::Runtime,
+    address: String,
+    service: Service,
+    allow_uids: Vec<u32>,
+) {
+    std::thread::spawn(move || {
+        let outcome = runtime.block_on(async {
+            tokio::select! {
+                result = server::serve(&address, service, &allow_uids) => result,
+                () = server::shutdown_signal() => Ok(()),
+            }
+        });
+        // Don't leave a stale socket behind.
+        if let Some(path) = server::socket_path(&address) {
+            let _ = std::fs::remove_file(path);
+        }
+        if let Err(err) = outcome {
+            tracing::error!("server stopped: {err}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    });
+}
+
 /// Starts the gRPC server and shows a dialog for every `AskRule` it receives.
 fn run_daemon(
     app: &adw::Application,
@@ -165,14 +219,8 @@ fn run_daemon(
     settings_path: PathBuf,
     allow_uids: Vec<u32>,
 ) {
-    let address = socket
-        .or_else(|| Settings::load(&settings_path).server_address)
-        .unwrap_or_else(|| DEFAULT_ADDRESS.to_string());
-    if let Some(dir) = server::socket_path(&address)
-        .as_deref()
-        .and_then(|p| p.parent())
-        && !dir.is_dir()
-    {
+    let address = listen_address(socket, &settings_path);
+    if let Some(dir) = missing_socket_dir(&address) {
         tracing::error!("socket directory {} does not exist", dir.display());
         app.quit();
         return;
@@ -183,83 +231,67 @@ fn run_daemon(
     let service = Service::new(prompts, settings_path);
     let link = service.link();
     link.keep_pause_in(glib::user_runtime_dir().join("snitch-paused"));
-    let runtime = match tokio::runtime::Builder::new_multi_thread()
-        .enable_all()
-        .build()
-    {
-        Ok(runtime) => runtime,
-        Err(err) => {
-            tracing::error!("cannot start the async runtime: {err}");
-            std::process::exit(1);
-        }
-    };
+    let runtime = start_runtime();
     let updater = Updater::on(link, runtime.handle().clone());
-    let serve_address = address.clone();
-    std::thread::spawn(move || {
-        let outcome = runtime.block_on(async {
-            tokio::select! {
-                result = server::serve(&serve_address, service, &allow_uids) => result,
-                () = server::shutdown_signal() => Ok(()),
-            }
-        });
-        // Don't leave a stale socket behind.
-        if let Some(path) = server::socket_path(&serve_address) {
-            let _ = std::fs::remove_file(path);
-        }
-        if let Err(err) = outcome {
-            tracing::error!("server stopped: {err}");
-            std::process::exit(1);
-        }
-        std::process::exit(0);
-    });
+    spawn_server(runtime, address, service, allow_uids);
     bus::serve(updater, bus_settings);
 
     // Prompts are handled one after another on the GTK thread.
     let prompt_app = app.clone();
     glib::spawn_future_local(async move {
-        while let Ok(PromptRequest {
-            con,
-            settings,
-            mismatch,
-            updater,
-            reply,
-        }) = requests.recv().await
-        {
-            let reply = Rc::new(RefCell::new(Some(reply)));
-            let gone = reply.clone();
-            let cancelled = move || gone.borrow().as_ref().is_none_or(|r| r.is_closed());
-            let checks = dialog::Checks { mismatch, updater };
-            let asked = con.clone();
-            let answer = dialog::prompt(&prompt_app, con, settings, checks, cancelled).await;
-            let abandoned = reply.borrow().as_ref().is_none_or(|r| r.is_closed());
-            match (&answer.rule, answer.timed_out) {
-                (Some(rule), true) => tracing::info!(
-                    "no answer in time, applied the default: {} {}",
-                    rule.action,
-                    rule.duration
-                ),
-                (None, _) if abandoned => tracing::info!(
-                    "the daemon stopped waiting for {}",
-                    view::connection_summary(&asked)
-                ),
-                (None, _) => tracing::warn!(
-                    "no rule came out of the prompt for {}",
-                    view::connection_summary(&asked)
-                ),
-                (Some(_), false) => {}
-            }
-            if answer.timed_out
-                && let Some(rule) = &answer.rule
-            {
-                let (title, body) = view::missed_popup(&asked, rule);
-                glib::spawn_future_local(notify_desktop(title, body));
-            }
-            if let Some(reply) = reply.borrow_mut().take() {
-                // The daemon may have given up meanwhile; nothing to do then.
-                let _ = reply.send(answer.rule);
-            }
+        while let Ok(request) = requests.recv().await {
+            handle_prompt(&prompt_app, request).await;
         }
     });
+}
+
+/// Shows the dialog for one request and sends the answer back to the daemon.
+async fn handle_prompt(app: &adw::Application, request: PromptRequest) {
+    let PromptRequest {
+        con,
+        settings,
+        mismatch,
+        updater,
+        reply,
+    } = request;
+    let reply = Rc::new(RefCell::new(Some(reply)));
+    let gone = reply.clone();
+    let cancelled = move || gone.borrow().as_ref().is_none_or(|r| r.is_closed());
+    let checks = dialog::Checks { mismatch, updater };
+    let asked = con.clone();
+    let answer = dialog::prompt(app, con, settings, checks, cancelled).await;
+    let abandoned = reply.borrow().as_ref().is_none_or(|r| r.is_closed());
+    log_answer(&answer, &asked, abandoned);
+    if answer.timed_out
+        && let Some(rule) = &answer.rule
+    {
+        let (title, body) = view::missed_popup(&asked, rule);
+        glib::spawn_future_local(notify_desktop(title, body));
+    }
+    if let Some(reply) = reply.borrow_mut().take() {
+        // The daemon may have given up meanwhile; nothing to do then.
+        let _ = reply.send(answer.rule);
+    }
+}
+
+/// Logs what became of a prompt, when that is worth a line.
+fn log_answer(answer: &dialog::Answer, asked: &proto::Connection, abandoned: bool) {
+    match (&answer.rule, answer.timed_out) {
+        (Some(rule), true) => tracing::info!(
+            "no answer in time, applied the default: {} {}",
+            rule.action,
+            rule.duration
+        ),
+        (None, _) if abandoned => tracing::info!(
+            "the daemon stopped waiting for {}",
+            view::connection_summary(asked)
+        ),
+        (None, _) => tracing::warn!(
+            "no rule came out of the prompt for {}",
+            view::connection_summary(asked)
+        ),
+        (Some(_), false) => {}
+    }
 }
 
 /// Shows a desktop notification through `org.freedesktop.Notifications`, the
@@ -347,5 +379,29 @@ mod tests {
         assert!(parse(&["--demo-scenario", "nope"]).is_err());
         assert!(parse(&["--socket"]).is_err());
         assert!(parse(&["--wat"]).is_err());
+    }
+
+    #[test]
+    fn the_listen_address_prefers_the_option_then_the_file_then_the_default() {
+        let missing = Path::new("/nonexistent/settings.conf");
+        assert_eq!(listen_address(Some("unix:/x".into()), missing), "unix:/x");
+        assert_eq!(listen_address(None, missing), DEFAULT_ADDRESS);
+
+        let dir = std::env::temp_dir().join(format!("snitch-main-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("settings.conf");
+        std::fs::write(&file, "[global]\nserver_address=unix:///run/x.sock\n").unwrap();
+        assert_eq!(listen_address(None, &file), "unix:///run/x.sock");
+        assert_eq!(listen_address(Some("unix:/y".into()), &file), "unix:/y");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn only_a_missing_socket_directory_is_reported() {
+        let missing = missing_socket_dir("unix:///nonexistent-dir/osui.sock");
+        assert_eq!(missing, Some(PathBuf::from("/nonexistent-dir")));
+        assert_eq!(missing_socket_dir("unix:///tmp/osui.sock"), None);
+        // A TCP address has no directory.
+        assert_eq!(missing_socket_dir("127.0.0.1:50051"), None);
     }
 }

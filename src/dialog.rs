@@ -591,20 +591,9 @@ impl Dialog {
     /// and the warning.
     fn show_outcome(&self, ui: &ChecksumsUi, outcome: &Outcome) {
         remove_names(&ui.names, &outcome.updated);
-        match &outcome.error {
-            None => {
-                ui.status.add_css_class("success");
-                ui.status.set_text(&match outcome.updated.len() {
-                    1 => "\u{2714} Rule updated.".to_string(),
-                    n => format!("\u{2714} {n} rules updated."),
-                });
-            }
-            Some(err) => {
-                ui.status.add_css_class("error");
-                ui.status
-                    .set_text(&format!("\u{2718} {}", view::printable(err)));
-            }
-        }
+        let (class, text) = outcome_line(outcome);
+        ui.status.add_css_class(class);
+        ui.status.set_text(&text);
         ui.buttons.set_sensitive(true);
         if list_names(&ui.names).is_empty() {
             self.retire_checksums(ui);
@@ -728,7 +717,7 @@ impl Dialog {
     /// One second of the timer: stops when answered or cancelled, and applies
     /// the default action when the countdown reaches zero.
     fn tick(&self, cancelled: &impl Fn() -> bool) -> gtk::glib::ControlFlow {
-        use gtk::glib::ControlFlow::{Break, Continue};
+        use gtk::glib::ControlFlow::Break;
         if self.done.get() {
             return Break;
         }
@@ -736,18 +725,25 @@ impl Dialog {
             self.finish(None);
             return Break;
         }
-        if !self.counting.get() || self.timeout == 0 {
-            return Continue;
+        self.advance_countdown()
+    }
+
+    /// Counts one second down, and applies the default action at zero.
+    fn advance_countdown(&self) -> gtk::glib::ControlFlow {
+        match countdown(self.counting.get(), self.timeout, self.remaining.get()) {
+            Countdown::Idle => gtk::glib::ControlFlow::Continue,
+            Countdown::Running(left) => {
+                self.remaining.set(left);
+                self.update_buttons();
+                gtk::glib::ControlFlow::Continue
+            }
+            Countdown::Expired => {
+                self.remaining.set(0);
+                self.timed_out.set(true);
+                self.send_rule(self.default_action);
+                gtk::glib::ControlFlow::Break
+            }
         }
-        let left = self.remaining.get().saturating_sub(1);
-        self.remaining.set(left);
-        if left == 0 {
-            self.timed_out.set(true);
-            self.send_rule(self.default_action);
-            return Break;
-        }
-        self.update_buttons();
-        Continue
     }
 
     /// Builds the rule from the current selection and answers the daemon.
@@ -789,9 +785,40 @@ impl Dialog {
     }
 }
 
-/// Pins the window to a screen corner when the compositor supports layer-shell
-/// (wlroots, KDE). Elsewhere the compositor decides where it goes.
-fn place(window: &adw::Window, position: u32) {
+/// Where the countdown stands after one more second.
+#[derive(Debug, PartialEq, Eq)]
+enum Countdown {
+    /// Not counting: stopped by the user, or the popup has no timeout.
+    Idle,
+    /// This many seconds are left.
+    Running(u32),
+    /// Time is up: the default action applies.
+    Expired,
+}
+
+/// One second of the countdown, which only runs while `counting` and with a
+/// non-zero `timeout`.
+fn countdown(counting: bool, timeout: u32, remaining: u32) -> Countdown {
+    if !counting || timeout == 0 {
+        return Countdown::Idle;
+    }
+    match remaining.saturating_sub(1) {
+        0 => Countdown::Expired,
+        left => Countdown::Running(left),
+    }
+}
+
+/// Style class and text that tell how a checksum update went.
+fn outcome_line(outcome: &Outcome) -> (&'static str, String) {
+    match (&outcome.error, outcome.updated.len()) {
+        (None, 1) => ("success", "\u{2714} Rule updated.".to_string()),
+        (None, n) => ("success", format!("\u{2714} {n} rules updated.")),
+        (Some(err), _) => ("error", format!("\u{2718} {}", view::printable(err))),
+    }
+}
+
+/// Whether the compositor can pin windows with layer-shell.
+fn layer_shell_usable() -> bool {
     // layer-shell asserts on non-Wayland displays, so check before asking.
     let on_wayland =
         gtk::gdk::Display::default().is_some_and(|d| d.type_().name() == "GdkWaylandDisplay");
@@ -799,22 +826,82 @@ fn place(window: &adw::Window, position: u32) {
     // print a notice about the session-lock protocol on every start.
     let on_gnome =
         std::env::var("XDG_CURRENT_DESKTOP").is_ok_and(|d| d.split(':').any(|p| p == "GNOME"));
-    if !on_wayland || on_gnome || !gtk4_layer_shell::is_supported() {
+    on_wayland && !on_gnome && gtk4_layer_shell::is_supported()
+}
+
+/// The screen edges the prompt sticks to for `default_popup_position`:
+/// 0 centre, 1 top right, 2 bottom right, 3 top left, 4 bottom left.
+fn corner(position: u32) -> (Option<Edge>, Option<Edge>) {
+    match position {
+        1 => (Some(Edge::Top), Some(Edge::Right)),
+        2 => (Some(Edge::Bottom), Some(Edge::Right)),
+        3 => (Some(Edge::Top), Some(Edge::Left)),
+        4 => (Some(Edge::Bottom), Some(Edge::Left)),
+        _ => (None, None),
+    }
+}
+
+/// Pins the window to a screen corner when the compositor supports layer-shell
+/// (wlroots, KDE). Elsewhere the compositor decides where it goes.
+fn place(window: &adw::Window, position: u32) {
+    if !layer_shell_usable() {
         return;
     }
     window.init_layer_shell();
     window.set_layer(Layer::Overlay);
     window.set_keyboard_mode(KeyboardMode::OnDemand);
     window.set_namespace(Some("snitch"));
-    let (vertical, horizontal) = match position {
-        1 => (Some(Edge::Top), Some(Edge::Right)),
-        2 => (Some(Edge::Bottom), Some(Edge::Right)),
-        3 => (Some(Edge::Top), Some(Edge::Left)),
-        4 => (Some(Edge::Bottom), Some(Edge::Left)),
-        _ => (None, None),
-    };
+    let (vertical, horizontal) = corner(position);
     for edge in [vertical, horizontal].into_iter().flatten() {
         window.set_anchor(edge, true);
         window.set_margin(edge, 24);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_countdown_runs_down_and_expires() {
+        assert_eq!(countdown(true, 30, 30), Countdown::Running(29));
+        assert_eq!(countdown(true, 30, 2), Countdown::Running(1));
+        assert_eq!(countdown(true, 30, 1), Countdown::Expired);
+        assert_eq!(countdown(true, 30, 0), Countdown::Expired);
+    }
+
+    #[test]
+    fn the_countdown_stays_idle_when_stopped_or_without_timeout() {
+        assert_eq!(countdown(false, 30, 10), Countdown::Idle);
+        assert_eq!(countdown(true, 0, 10), Countdown::Idle);
+    }
+
+    #[test]
+    fn an_update_is_described_by_its_outcome() {
+        let updated = |n: usize, error: Option<&str>| Outcome {
+            updated: vec!["rule".to_string(); n],
+            error: error.map(String::from),
+        };
+        assert_eq!(
+            outcome_line(&updated(1, None)),
+            ("success", "\u{2714} Rule updated.".to_string())
+        );
+        assert_eq!(
+            outcome_line(&updated(3, None)),
+            ("success", "\u{2714} 3 rules updated.".to_string())
+        );
+        let (class, text) = outcome_line(&updated(1, Some("daemon says no")));
+        assert_eq!(class, "error");
+        assert!(text.ends_with("daemon says no"), "{text}");
+    }
+
+    #[test]
+    fn the_position_maps_to_screen_edges() {
+        assert_eq!(corner(0), (None, None));
+        assert_eq!(corner(1), (Some(Edge::Top), Some(Edge::Right)));
+        assert_eq!(corner(2), (Some(Edge::Bottom), Some(Edge::Right)));
+        assert_eq!(corner(3), (Some(Edge::Top), Some(Edge::Left)));
+        assert_eq!(corner(4), (Some(Edge::Bottom), Some(Edge::Left)));
+        assert_eq!(corner(99), (None, None));
     }
 }

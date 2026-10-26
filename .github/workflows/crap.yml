@@ -1,0 +1,52 @@
+name: CRAP
+
+# Only changes that can move a score run it: it runs the tests with coverage.
+on:
+  push:
+    branches: [master]
+    paths:
+      - "src/**"
+      - "build.rs"
+      - "proto/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo-crap.toml"
+      - "clippy.toml"
+      - ".github/workflows/crap.yml"
+      - ".github/workflows/_arch-cargo.yml"
+  pull_request:
+    paths:
+      - "src/**"
+      - "build.rs"
+      - "proto/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".cargo-crap.toml"
+      - "clippy.toml"
+      - ".github/workflows/crap.yml"
+      - ".github/workflows/_arch-cargo.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # Scores each function by complexity and test coverage (CRAP) and fails when
+  # one scores above the threshold in .cargo-crap.toml. cargo-crap isn't in the
+  # Arch repositories, so it is built from a pinned version.
+  crap:
+    uses: ./.github/workflows/_arch-cargo.yml
+    with:
+      build-deps: true
+      packages: cargo-llvm-cov llvm
+      cache-key: crap
+      timeout: 40
+      script: |
+        cargo install cargo-crap --locked --version 0.9.0
+        export PATH="$HOME/.cargo/bin:$PATH"
+        cargo llvm-cov --lcov --output-path lcov.info --locked
+        cargo crap --lcov lcov.info --fail-above

@@ -100,9 +100,8 @@ fn property(state: DaemonState, settings: &Path, name: &str) -> Variant {
     }
 }
 
-/// Emits `PropertiesChanged` and, when the firewall was paused or resumed,
-/// shows a notification so that change can't go unnoticed.
-fn announce(connection: &DBusConnection, before: DaemonState, now: DaemonState) {
+/// The properties that differ between two states, as `PropertiesChanged` wants.
+fn changed_properties(before: DaemonState, now: DaemonState) -> HashMap<&'static str, Variant> {
     let mut changed = HashMap::new();
     if before.interception != now.interception {
         changed.insert("Interception", now.interception.as_str().to_variant());
@@ -110,6 +109,29 @@ fn announce(connection: &DBusConnection, before: DaemonState, now: DaemonState) 
     if before.connected != now.connected {
         changed.insert("Connected", now.connected.to_variant());
     }
+    changed
+}
+
+/// Title and text of the notification a change of interception calls for:
+/// every pause and every resume is shown so it can't go unnoticed.
+fn notice(before: Interception, now: Interception) -> Option<(&'static str, &'static str)> {
+    match (before, now) {
+        (Interception::Off, Interception::Off) => None,
+        (_, Interception::Off) => Some((
+            "Firewall paused",
+            "OpenSnitch no longer asks about connections.",
+        )),
+        (Interception::Off, Interception::On) => {
+            Some(("Firewall on", "OpenSnitch asks about connections again."))
+        }
+        _ => None,
+    }
+}
+
+/// Emits `PropertiesChanged` and, when the firewall was paused or resumed,
+/// shows a notification so that change can't go unnoticed.
+fn announce(connection: &DBusConnection, before: DaemonState, now: DaemonState) {
+    let changed = changed_properties(before, now);
     if changed.is_empty() {
         return;
     }
@@ -123,21 +145,8 @@ fn announce(connection: &DBusConnection, before: DaemonState, now: DaemonState) 
     ) {
         tracing::warn!("cannot announce the change on D-Bus: {err}");
     }
-
-    match (before.interception, now.interception) {
-        (_, Interception::Off) if before.interception != Interception::Off => {
-            glib::spawn_future_local(crate::notify_desktop(
-                "Firewall paused".into(),
-                "OpenSnitch no longer asks about connections.".into(),
-            ));
-        }
-        (Interception::Off, Interception::On) => {
-            glib::spawn_future_local(crate::notify_desktop(
-                "Firewall on".into(),
-                "OpenSnitch asks about connections again.".into(),
-            ));
-        }
-        _ => {}
+    if let Some((title, body)) = notice(before.interception, now.interception) {
+        glib::spawn_future_local(crate::notify_desktop(title.into(), body.into()));
     }
 }
 
@@ -186,40 +195,9 @@ async fn authorize(session: &DBusConnection, sender: &str) -> Result<(), glib::E
     let denied = |why: &str| glib::Error::new(gio::DBusError::AccessDenied, why);
 
     // Polkit identifies a caller by process, not by the session bus name.
-    let pid = session
-        .call_future(
-            Some("org.freedesktop.DBus"),
-            "/org/freedesktop/DBus",
-            "org.freedesktop.DBus",
-            "GetConnectionUnixProcessID",
-            Some(&(sender,).to_variant()),
-            None,
-            gio::DBusCallFlags::NONE,
-            5_000,
-        )
-        .await?
-        .get::<(u32,)>()
-        .ok_or_else(|| failed("unexpected reply about the caller"))?
-        .0;
+    let pid = caller_pid(session, sender).await?;
     let start_time = process_start_time(pid)
         .ok_or_else(|| denied("cannot identify the calling process for authorisation"))?;
-
-    let subject = (
-        "unix-process",
-        HashMap::from([
-            ("pid", pid.to_variant()),
-            ("start-time", start_time.to_variant()),
-        ]),
-    );
-    let allow_user_interaction = 1u32;
-    let params = (
-        subject,
-        POLKIT_ACTION,
-        HashMap::<String, String>::new(),
-        allow_user_interaction,
-        "",
-    )
-        .to_variant();
 
     // Only a checked "yes" counts; every failure below means no.
     let system = gio::bus_get_future(BusType::System).await.map_err(|err| {
@@ -234,13 +212,59 @@ async fn authorize(session: &DBusConnection, sender: &str) -> Result<(), glib::E
             "/org/freedesktop/PolicyKit1/Authority",
             "org.freedesktop.PolicyKit1.Authority",
             "CheckAuthorization",
-            Some(&params),
+            Some(&polkit_arguments(pid, start_time)),
             None,
             gio::DBusCallFlags::NONE,
             POLKIT_TIMEOUT_MS,
         )
         .await
         .map_err(|err| denied(&format!("polkit refused to answer: {}", err.message())))?;
+    verdict(&reply)
+}
+
+/// Process id behind the session bus name `sender`.
+async fn caller_pid(session: &DBusConnection, sender: &str) -> Result<u32, glib::Error> {
+    session
+        .call_future(
+            Some("org.freedesktop.DBus"),
+            "/org/freedesktop/DBus",
+            "org.freedesktop.DBus",
+            "GetConnectionUnixProcessID",
+            Some(&(sender,).to_variant()),
+            None,
+            gio::DBusCallFlags::NONE,
+            5_000,
+        )
+        .await?
+        .get::<(u32,)>()
+        .map(|(pid,)| pid)
+        .ok_or_else(|| failed("unexpected reply about the caller"))
+}
+
+/// Arguments of polkit's `CheckAuthorization` for the process `pid`: asks for
+/// `POLKIT_ACTION` and lets polkit interact with the user.
+fn polkit_arguments(pid: u32, start_time: u64) -> Variant {
+    let subject = (
+        "unix-process",
+        HashMap::from([
+            ("pid", pid.to_variant()),
+            ("start-time", start_time.to_variant()),
+        ]),
+    );
+    let allow_user_interaction = 1u32;
+    (
+        subject,
+        POLKIT_ACTION,
+        HashMap::<String, String>::new(),
+        allow_user_interaction,
+        "",
+    )
+        .to_variant()
+}
+
+/// Reads polkit's answer: only a plain "authorized" is a yes.
+fn verdict(reply: &Variant) -> Result<(), glib::Error> {
+    let denied = |why: &str| glib::Error::new(gio::DBusError::AccessDenied, why);
     let ((authorized, _challenge, _details),) = reply
         .get::<((bool, bool, HashMap<String, String>),)>()
         .ok_or_else(|| denied("unexpected answer from polkit"))?;
@@ -316,5 +340,67 @@ mod tests {
             property(state, Path::new("/a/settings.conf"), "SettingsPath").str(),
             Some("/a/settings.conf")
         );
+    }
+
+    fn state(connected: bool, interception: Interception) -> DaemonState {
+        DaemonState {
+            connected,
+            interception,
+        }
+    }
+
+    #[test]
+    fn only_what_changed_is_announced() {
+        let on = state(true, Interception::On);
+        assert!(changed_properties(on, on).is_empty());
+
+        let changed = changed_properties(on, state(true, Interception::Off));
+        assert_eq!(changed.len(), 1);
+        assert_eq!(changed["Interception"].str(), Some("off"));
+
+        let changed = changed_properties(on, state(false, Interception::Unknown));
+        assert_eq!(changed.len(), 2);
+        assert_eq!(changed["Connected"].get::<bool>(), Some(false));
+    }
+
+    #[test]
+    fn pauses_and_resumes_are_notified_and_nothing_else_is() {
+        use Interception::{Off, On, Unknown};
+        assert_eq!(notice(On, Off).map(|n| n.0), Some("Firewall paused"));
+        assert_eq!(notice(Unknown, Off).map(|n| n.0), Some("Firewall paused"));
+        assert_eq!(notice(Off, On).map(|n| n.0), Some("Firewall on"));
+        assert_eq!(notice(Off, Off), None);
+        assert_eq!(notice(On, On), None);
+        assert_eq!(notice(Unknown, On), None);
+        assert_eq!(notice(Off, Unknown), None);
+    }
+
+    #[test]
+    fn polkit_is_asked_about_the_calling_process() {
+        let args = polkit_arguments(4242, 987_654);
+        let ((kind, details), action, _, flags, _) = args
+            .get::<(
+                (String, HashMap<String, Variant>),
+                String,
+                HashMap<String, String>,
+                u32,
+                String,
+            )>()
+            .unwrap();
+        assert_eq!(kind, "unix-process");
+        assert_eq!(details["pid"].get::<u32>(), Some(4242));
+        assert_eq!(details["start-time"].get::<u64>(), Some(987_654));
+        assert_eq!(action, POLKIT_ACTION);
+        assert_eq!(flags, 1);
+    }
+
+    #[test]
+    fn only_a_plain_yes_from_polkit_counts() {
+        let reply =
+            |authorized| ((authorized, false, HashMap::<String, String>::new()),).to_variant();
+        assert!(verdict(&reply(true)).is_ok());
+        assert!(verdict(&reply(false)).is_err());
+        assert!(verdict(&"nonsense".to_variant()).is_err());
+        assert!(verdict(&().to_variant()).is_err());
     }
 }

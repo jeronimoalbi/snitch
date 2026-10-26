@@ -1,0 +1,2 @@
+# CRAP score above which a function is flagged.
+threshold = 30
