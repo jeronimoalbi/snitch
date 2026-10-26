@@ -309,9 +309,57 @@ impl Dialog {
     }
 
     fn build_ui(self: &Rc<Self>, info: Option<&gtk::gio::AppInfo>, app_name: &str, user: &str) {
-        let con = &self.con;
+        let (header, details_btn) = self.header(info, app_name);
+        let message = label(&view::popup_message(app_name, &self.con));
+        message.set_use_markup(true);
+        let warning = self.checksum_warning();
 
-        // Header: icon, names and the details button.
+        let revealer = gtk::Revealer::new();
+        revealer.set_child(Some(&self.advanced_grid(user)));
+        self.advanced
+            .bind_property("active", &revealer, "reveal-child")
+            .sync_create()
+            .build();
+
+        let main = padded_box(14);
+        main.append(&header);
+        main.append(&message);
+        if let Some(warning) = &warning {
+            main.append(warning);
+        }
+        main.append(&revealer);
+        main.append(&self.actions_row());
+
+        let (details, back) = self.details_page(user);
+        self.stack.add_named(&main, Some("main"));
+        self.stack.add_named(&details, Some("details"));
+        if !self.checks.mismatch.is_empty() {
+            self.stack
+                .add_named(&self.checksums_page(), Some("checksums"));
+        }
+
+        let bar = adw::HeaderBar::new();
+        bar.set_show_end_title_buttons(false);
+        bar.set_show_start_title_buttons(false);
+        let toolbar = adw::ToolbarView::new();
+        toolbar.add_top_bar(&bar);
+        toolbar.set_content(Some(&self.stack));
+        self.window.set_content(Some(&toolbar));
+
+        let d = self.clone();
+        details_btn.connect_clicked(move |_| {
+            d.stop_countdown();
+            d.stack.set_visible_child_name("details");
+        });
+        let d = self.clone();
+        back.connect_clicked(move |_| d.stack.set_visible_child_name("main"));
+
+        self.deny_btn.set_popover(Some(&self.deny_menu()));
+    }
+
+    /// Icon, names and the details button; the button is returned to be wired.
+    fn header(&self, info: Option<&gtk::gio::AppInfo>, app_name: &str) -> (gtk::Box, gtk::Button) {
+        let con = &self.con;
         let icon = gtk::Image::new();
         icon.set_pixel_size(48);
         match info.and_then(|i| i.icon()) {
@@ -354,12 +402,12 @@ impl Dialog {
         header.append(&icon);
         header.append(&titles);
         header.append(&details_btn);
+        (header, details_btn)
+    }
 
-        let message = label(&view::popup_message(app_name, con));
-        message.set_use_markup(true);
-        let warning = self.checksum_warning();
-
-        // Advanced rows.
+    /// The rows shown when the advanced options are revealed.
+    fn advanced_grid(&self, user: &str) -> gtk::Grid {
+        let con = &self.con;
         let grid = gtk::Grid::new();
         grid.set_row_spacing(6);
         grid.set_column_spacing(12);
@@ -387,14 +435,11 @@ impl Dialog {
                 label(&self.checksum).upcast(),
             );
         }
-        let revealer = gtk::Revealer::new();
-        revealer.set_child(Some(&grid));
-        self.advanced
-            .bind_property("active", &revealer, "reveal-child")
-            .sync_create()
-            .build();
+        grid
+    }
 
-        // Bottom row.
+    /// The bottom row: the "apply to" and duration choices and the buttons.
+    fn actions_row(&self) -> gtk::Box {
         let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
         let apply = gtk::Box::new(gtk::Orientation::Vertical, 6);
         apply.set_hexpand(true);
@@ -407,18 +452,12 @@ impl Dialog {
         actions.append(&self.allow_btn);
         actions.append(&self.advanced);
         actions.set_valign(gtk::Align::End);
+        actions
+    }
 
-        let main = padded_box(14);
-        main.append(&header);
-        main.append(&message);
-        if let Some(warning) = &warning {
-            main.append(warning);
-        }
-        main.append(&revealer);
-        main.append(&actions);
-
-        // Details page.
-        let text = gtk::Label::new(Some(&view::details_text(con, user)));
+    /// The process details page; the back button is returned to be wired.
+    fn details_page(&self, user: &str) -> (gtk::Box, gtk::Button) {
+        let text = gtk::Label::new(Some(&view::details_text(&self.con, user)));
         text.set_xalign(0.0);
         text.set_yalign(0.0);
         text.set_selectable(true);
@@ -434,31 +473,11 @@ impl Dialog {
         let details = padded_box(12);
         details.append(&scroll);
         details.append(&back);
+        (details, back)
+    }
 
-        self.stack.add_named(&main, Some("main"));
-        self.stack.add_named(&details, Some("details"));
-        if !self.checks.mismatch.is_empty() {
-            self.stack
-                .add_named(&self.checksums_page(), Some("checksums"));
-        }
-
-        let bar = adw::HeaderBar::new();
-        bar.set_show_end_title_buttons(false);
-        bar.set_show_start_title_buttons(false);
-        let toolbar = adw::ToolbarView::new();
-        toolbar.add_top_bar(&bar);
-        toolbar.set_content(Some(&self.stack));
-        self.window.set_content(Some(&toolbar));
-
-        let d = self.clone();
-        details_btn.connect_clicked(move |_| {
-            d.stop_countdown();
-            d.stack.set_visible_child_name("details");
-        });
-        let d = self.clone();
-        back.connect_clicked(move |_| d.stack.set_visible_child_name("main"));
-
-        // The Drop / Reject menu next to the deny button.
+    /// The Drop / Reject menu next to the deny button.
+    fn deny_menu(self: &Rc<Self>) -> gtk::Popover {
         let menu = gtk::Box::new(gtk::Orientation::Vertical, 2);
         let popover = gtk::Popover::new();
         for action in [Action::Drop, Action::Reject] {
@@ -472,7 +491,7 @@ impl Dialog {
             menu.append(&item);
         }
         popover.set_child(Some(&menu));
-        self.deny_btn.set_popover(Some(&popover));
+        popover
     }
 
     /// The red warning under the message, with a link to the checksums page.
@@ -518,16 +537,7 @@ impl Dialog {
         // `update_all` asks for every rule still listed, `update` for the selected one.
         for (button, all) in [(&ui.update, false), (&ui.update_all, true)] {
             let (d, ui) = (self.clone(), ui.clone());
-            button.connect_clicked(move |_| {
-                let targets = if all {
-                    list_names(&ui.names)
-                } else {
-                    selected_name(&ui.names).into_iter().collect()
-                };
-                if !targets.is_empty() {
-                    d.update_rules(&ui, targets);
-                }
-            });
+            button.connect_clicked(move |_| d.request_update(&ui, all));
         }
         let d = self.clone();
         back.connect_clicked(move |_| d.stack.set_visible_child_name("main"));
@@ -538,6 +548,18 @@ impl Dialog {
         page.append(&ui.status);
         page.append(&ui.buttons);
         page
+    }
+
+    /// Updates every rule still listed (`all`) or the selected one.
+    fn request_update(self: &Rc<Self>, ui: &ChecksumsUi, all: bool) {
+        let targets = if all {
+            list_names(&ui.names)
+        } else {
+            selected_name(&ui.names).into_iter().collect()
+        };
+        if !targets.is_empty() {
+            self.update_rules(ui, targets);
+        }
     }
 
     /// Pins the program's checksum in `names` and reports the outcome on the page.
@@ -561,32 +583,43 @@ impl Dialog {
                     error: None,
                 },
             };
-            remove_names(&ui.names, &outcome.updated);
-            match &outcome.error {
-                None => {
-                    ui.status.add_css_class("success");
-                    ui.status.set_text(&match outcome.updated.len() {
-                        1 => "\u{2714} Rule updated.".to_string(),
-                        n => format!("\u{2714} {n} rules updated."),
-                    });
-                }
-                Some(err) => {
-                    ui.status.add_css_class("error");
-                    ui.status
-                        .set_text(&format!("\u{2718} {}", view::printable(err)));
-                }
-            }
-            ui.buttons.set_sensitive(true);
-            if list_names(&ui.names).is_empty() {
-                for b in [&ui.update, &ui.update_all] {
-                    b.set_sensitive(false);
-                }
-                ui.names.set_sensitive(false);
-                if let Some(warning) = d.warning.borrow().as_ref() {
-                    warning.set_visible(false);
-                }
-            }
+            d.show_outcome(&ui, &outcome);
         });
+    }
+
+    /// Shows how an update went and, when no rule is left, retires the page
+    /// and the warning.
+    fn show_outcome(&self, ui: &ChecksumsUi, outcome: &Outcome) {
+        remove_names(&ui.names, &outcome.updated);
+        match &outcome.error {
+            None => {
+                ui.status.add_css_class("success");
+                ui.status.set_text(&match outcome.updated.len() {
+                    1 => "\u{2714} Rule updated.".to_string(),
+                    n => format!("\u{2714} {n} rules updated."),
+                });
+            }
+            Some(err) => {
+                ui.status.add_css_class("error");
+                ui.status
+                    .set_text(&format!("\u{2718} {}", view::printable(err)));
+            }
+        }
+        ui.buttons.set_sensitive(true);
+        if list_names(&ui.names).is_empty() {
+            self.retire_checksums(ui);
+        }
+    }
+
+    /// Nothing is left to update: disable the page and hide the warning.
+    fn retire_checksums(&self, ui: &ChecksumsUi) {
+        for b in [&ui.update, &ui.update_all] {
+            b.set_sensitive(false);
+        }
+        ui.names.set_sensitive(false);
+        if let Some(warning) = self.warning.borrow().as_ref() {
+            warning.set_visible(false);
+        }
     }
 
     /// Action of the deny button: the saved default unless that is "allow".
@@ -689,26 +722,32 @@ impl Dialog {
         self.advanced.grab_focus();
         self.window.present();
         let d = self.clone();
-        gtk::glib::timeout_add_seconds_local(1, move || {
-            if d.done.get() {
-                return gtk::glib::ControlFlow::Break;
-            }
-            if cancelled() {
-                d.finish(None);
-                return gtk::glib::ControlFlow::Break;
-            }
-            if d.counting.get() && d.timeout > 0 {
-                let left = d.remaining.get().saturating_sub(1);
-                d.remaining.set(left);
-                if left == 0 {
-                    d.timed_out.set(true);
-                    d.send_rule(d.default_action);
-                    return gtk::glib::ControlFlow::Break;
-                }
-                d.update_buttons();
-            }
-            gtk::glib::ControlFlow::Continue
-        });
+        gtk::glib::timeout_add_seconds_local(1, move || d.tick(&cancelled));
+    }
+
+    /// One second of the timer: stops when answered or cancelled, and applies
+    /// the default action when the countdown reaches zero.
+    fn tick(&self, cancelled: &impl Fn() -> bool) -> gtk::glib::ControlFlow {
+        use gtk::glib::ControlFlow::{Break, Continue};
+        if self.done.get() {
+            return Break;
+        }
+        if cancelled() {
+            self.finish(None);
+            return Break;
+        }
+        if !self.counting.get() || self.timeout == 0 {
+            return Continue;
+        }
+        let left = self.remaining.get().saturating_sub(1);
+        self.remaining.set(left);
+        if left == 0 {
+            self.timed_out.set(true);
+            self.send_rule(self.default_action);
+            return Break;
+        }
+        self.update_buttons();
+        Continue
     }
 
     /// Builds the rule from the current selection and answers the daemon.

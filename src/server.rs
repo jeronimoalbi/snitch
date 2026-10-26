@@ -455,12 +455,17 @@ mod tests {
         let (tx, rx) = async_channel::unbounded::<PromptRequest>();
         tokio::spawn(async move {
             while let Ok(request) = rx.recv().await {
-                if let Some(rule) = answer.clone() {
-                    let _ = request.reply.send(Some(rule));
-                }
+                reply_with(answer.clone(), request);
             }
         });
         Service::new(tx, PathBuf::from("/nonexistent/settings.conf"))
+    }
+
+    /// Answers `request` with `answer`, or leaves it unanswered.
+    fn reply_with(answer: Option<Rule>, request: PromptRequest) {
+        if let Some(rule) = answer {
+            let _ = request.reply.send(Some(rule));
+        }
     }
 
     fn rule(name: &str) -> Rule {
@@ -477,21 +482,24 @@ mod tests {
         assert_eq!(reply.into_inner().name, "user-choice");
     }
 
+    /// Answers `count` requests with rules named `answer-1`, `answer-2`...
+    /// and returns how many it answered.
+    async fn answer_numbered(rx: async_channel::Receiver<PromptRequest>, count: usize) -> usize {
+        let mut n = 0;
+        while n < count
+            && let Ok(request) = rx.recv().await
+        {
+            n += 1;
+            let _ = request.reply.send(Some(rule(&format!("answer-{n}"))));
+        }
+        n
+    }
+
     #[tokio::test]
     async fn identical_connections_reuse_the_answer() {
         let (tx, rx) = async_channel::unbounded::<PromptRequest>();
         let svc = Service::new(tx, PathBuf::from("/nonexistent/settings.conf"));
-        let asked = tokio::spawn(async move {
-            let mut n = 0;
-            while let Ok(request) = rx.recv().await {
-                n += 1;
-                let _ = request.reply.send(Some(rule(&format!("answer-{n}"))));
-                if n == 2 {
-                    break;
-                }
-            }
-            n
-        });
+        let asked = tokio::spawn(answer_numbered(rx, 2));
         let first = svc.ask_rule(Request::new(con())).await.unwrap();
         let second = svc.ask_rule(Request::new(con())).await.unwrap();
         assert_eq!(first.into_inner().name, "answer-1");
@@ -660,7 +668,7 @@ mod tests {
     /// This sends the same request as raw bytes and expects a normal reply.
     #[tokio::test]
     async fn accepts_the_invalid_authority_sent_by_grpc_go() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         let (tx, _rx) = async_channel::unbounded::<PromptRequest>();
         let service = Service::new(tx, PathBuf::from("/nonexistent/settings.conf"));
@@ -692,34 +700,8 @@ mod tests {
         let mut conn = tokio::net::TcpStream::connect(addr).await.unwrap();
         conn.write_all(&request).await.unwrap();
 
-        // Read frames until the reply arrives or the stream is reset.
-        let mut reply = Vec::new();
-        let outcome = tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let mut head = [0u8; 9];
-                conn.read_exact(&mut head).await.unwrap();
-                let len =
-                    usize::try_from(u32::from_be_bytes([0, head[0], head[1], head[2]])).unwrap();
-                let mut payload = vec![0u8; len];
-                conn.read_exact(&mut payload).await.unwrap();
-                match (
-                    head[3],
-                    u32::from_be_bytes([head[5], head[6], head[7], head[8]]),
-                ) {
-                    (0x3, 1) => return Err(format!("stream reset, code {payload:?}")),
-                    (0x7, _) => return Err(format!("connection closed (GOAWAY), {payload:?}")),
-                    (0x0, 1) => {
-                        reply.extend(payload);
-                        return Ok(());
-                    }
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .expect("no reply within 5 seconds");
-
-        assert_eq!(outcome, Ok(()));
+        let (served, reply) = answer_of(&mut conn).await.expect("no usable answer");
+        assert_eq!(served, Served::Reply);
         assert_eq!(reply, [0, 0, 0, 0, 2, 0x08, 0x07], "PingReply with id 7");
     }
 
@@ -750,39 +732,73 @@ mod tests {
         Refused,
     }
 
+    /// Reads one HTTP/2 frame: `(type, flags, stream, payload)`.
+    async fn read_frame<S>(conn: &mut S) -> Result<(u8, u8, u32, Vec<u8>), String>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        use tokio::io::AsyncReadExt;
+
+        let mut head = [0u8; 9];
+        conn.read_exact(&mut head)
+            .await
+            .map_err(|e| e.to_string())?;
+        let len = u32::from_be_bytes([0, head[0], head[1], head[2]]);
+        let mut payload = vec![0u8; usize::try_from(len).map_err(|e| e.to_string())?];
+        conn.read_exact(&mut payload)
+            .await
+            .map_err(|e| e.to_string())?;
+        let stream = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
+        Ok((head[3], head[4], stream, payload))
+    }
+
+    /// What a frame means for the call on stream 1, once it settles the outcome.
+    fn decide(
+        kind: u8,
+        flags: u8,
+        stream: u32,
+        payload: Vec<u8>,
+    ) -> Option<Result<(Served, Vec<u8>), String>> {
+        match (kind, stream) {
+            (0x0, 1) => Some(Ok((Served::Reply, payload))),
+            (0x1, 1) if flags & 0x1 != 0 => Some(Ok((Served::Refused, payload))),
+            (0x3, 1) => Some(Err(format!("stream reset {payload:?}"))),
+            (0x7, _) => Some(Err(format!("GOAWAY {payload:?}"))),
+            _ => None,
+        }
+    }
+
+    /// Reads frames until the call is answered, with the reply's body.
+    async fn answer_of<S>(conn: &mut S) -> Result<(Served, Vec<u8>), String>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        tokio::time::timeout(Duration::from_secs(5), next_answer(conn))
+            .await
+            .map_err(|_| "no answer within 5 seconds".to_string())?
+    }
+
+    async fn next_answer<S>(conn: &mut S) -> Result<(Served, Vec<u8>), String>
+    where
+        S: tokio::io::AsyncRead + Unpin,
+    {
+        loop {
+            let (kind, flags, stream, payload) = read_frame(conn).await?;
+            if let Some(result) = decide(kind, flags, stream, payload) {
+                return result;
+            }
+        }
+    }
+
     /// Sends `Ping` over `conn` and tells whether it was served or refused.
     async fn ping_outcome<S>(conn: &mut S) -> Result<Served, String>
     where
         S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::io::AsyncWriteExt;
 
         conn.write_all(&ping_request()).await.unwrap();
-        tokio::time::timeout(Duration::from_secs(5), async {
-            loop {
-                let mut head = [0u8; 9];
-                conn.read_exact(&mut head)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let len =
-                    usize::try_from(u32::from_be_bytes([0, head[0], head[1], head[2]])).unwrap();
-                let mut payload = vec![0u8; len];
-                conn.read_exact(&mut payload)
-                    .await
-                    .map_err(|e| e.to_string())?;
-                let (kind, flags) = (head[3], head[4]);
-                let stream = u32::from_be_bytes([head[5], head[6], head[7], head[8]]);
-                match (kind, stream) {
-                    (0x0, 1) => return Ok(Served::Reply),
-                    (0x1, 1) if flags & 0x1 != 0 => return Ok(Served::Refused),
-                    (0x3, 1) => return Err(format!("stream reset {payload:?}")),
-                    (0x7, _) => return Err(format!("GOAWAY {payload:?}")),
-                    _ => {}
-                }
-            }
-        })
-        .await
-        .map_err(|_| "no answer within 5 seconds".to_string())?
+        answer_of(conn).await.map(|(served, _)| served)
     }
 
     /// Serves on `address` in the background and connects to the unix `path`.
@@ -818,21 +834,15 @@ mod tests {
     /// socket (it is 0600) but must not be taken for the daemon.
     #[tokio::test]
     async fn a_non_root_process_is_refused_on_a_unix_socket() {
+        check_unix_peer_policy().await;
+    }
+
+    async fn check_unix_peer_policy() {
         use std::os::unix::fs::MetadataExt;
 
         let own_uid = std::fs::metadata("/proc/self").unwrap().uid();
         for allowed in [vec![], vec![own_uid]] {
-            let path = std::env::temp_dir().join(format!(
-                "snitch-peer-{}-{}.sock",
-                std::process::id(),
-                allowed.len()
-            ));
-            let (server, mut conn) =
-                serve_and_connect(format!("unix:{}", path.display()), &path, allowed.clone()).await;
-            let outcome = ping_outcome(&mut conn).await;
-            server.abort();
-            let _ = std::fs::remove_file(&path);
-
+            let outcome = unix_ping_outcome(&allowed).await;
             // Running the tests as root makes the first case legitimate.
             let expect = if allowed.is_empty() && own_uid != 0 {
                 Served::Refused
@@ -845,6 +855,33 @@ mod tests {
                 "allowed uids {allowed:?}, running as {own_uid}"
             );
         }
+    }
+
+    /// Serves on a unix socket that lets `allowed` users act as the daemon, and
+    /// pings it from this process.
+    async fn unix_ping_outcome(allowed: &[u32]) -> Result<Served, String> {
+        let path = std::env::temp_dir().join(format!(
+            "snitch-peer-{}-{}.sock",
+            std::process::id(),
+            allowed.len()
+        ));
+        let (server, mut conn) =
+            serve_and_connect(format!("unix:{}", path.display()), &path, allowed.to_vec()).await;
+        let outcome = ping_outcome(&mut conn).await;
+        server.abort();
+        let _ = std::fs::remove_file(&path);
+        outcome
+    }
+
+    /// Connects to the local `port`, waiting for the server to start listening.
+    async fn connect_tcp(port: u16) -> tokio::net::TcpStream {
+        for _ in 0..100 {
+            if let Ok(conn) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
+                return conn;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        panic!("the server never started listening on port {port}");
     }
 
     /// TCP carries no process identity, so it is still served (with a warning).
@@ -860,15 +897,7 @@ mod tests {
         let server = tokio::spawn(async move {
             let _ = serve(&address, service, &[]).await;
         });
-        let mut conn = None;
-        for _ in 0..100 {
-            if let Ok(c) = tokio::net::TcpStream::connect(("127.0.0.1", port)).await {
-                conn = Some(c);
-                break;
-            }
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-        let mut conn = conn.expect("the server never started listening");
+        let mut conn = connect_tcp(port).await;
         let outcome = ping_outcome(&mut conn).await;
         server.abort();
         assert_eq!(outcome, Ok(Served::Reply));

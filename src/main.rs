@@ -28,6 +28,8 @@ use crate::server::{PromptRequest, Service};
 use crate::settings::{DEFAULT_ADDRESS, Settings};
 
 /// Types generated from `proto/ui.proto`.
+// Generated code, which is not ours to reshape for the complexity lints.
+#[allow(clippy::excessive_nesting, clippy::too_many_lines)]
 pub mod proto {
     tonic::include_proto!("protocol");
 }
