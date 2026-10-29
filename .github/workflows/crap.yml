@@ -1,6 +1,7 @@
 name: CRAP
 
-# Only changes that can move a score run it: it runs the tests with coverage.
+# Only changes that can move a score run it: it runs the tests twice on pull
+# requests (head and base commit), with coverage.
 on:
   push:
     branches: [master]
@@ -13,8 +14,8 @@ on:
       - ".cargo-crap.toml"
       - "clippy.toml"
       - ".github/workflows/crap.yml"
-      - ".github/workflows/_arch-cargo.yml"
   pull_request:
+    types: [opened, synchronize, reopened]
     paths:
       - "src/**"
       - "build.rs"
@@ -24,29 +25,51 @@ on:
       - ".cargo-crap.toml"
       - "clippy.toml"
       - ".github/workflows/crap.yml"
-      - ".github/workflows/_arch-cargo.yml"
   workflow_dispatch:
 
+# Needed to post the score comment on pull requests.
 permissions:
   contents: read
+  pull-requests: write
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: crap-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  CARGO_TERM_COLOR: always
+
 jobs:
-  # Scores each function by complexity and test coverage (CRAP) and fails when
-  # one scores above the threshold in .cargo-crap.toml. cargo-crap isn't in the
-  # Arch repositories, so it is built from a pinned version.
+  # Scores each function by complexity and test coverage (CRAP). On a pull
+  # request it compares with the base commit, comments the changes and fails
+  # when a score rose; it also fails when a function is above the threshold in
+  # .cargo-crap.toml. On push it writes the report to the job summary.
+  #
+  # The other workflows run on Arch, but this one needs rustup's llvm-tools,
+  # which Arch's rust package lacks. Ubuntu 26.04 is the first LTS that ships
+  # gtk4-layer-shell; 24.04 doesn't.
   crap:
-    uses: ./.github/workflows/_arch-cargo.yml
-    with:
-      build-deps: true
-      packages: cargo-llvm-cov llvm
-      cache-key: crap
-      timeout: 40
-      script: |
-        cargo install cargo-crap --locked --version 0.9.0
-        export PATH="$HOME/.cargo/bin:$PATH"
-        cargo llvm-cov --lcov --output-path lcov.info --locked
-        cargo crap --lcov lcov.info --fail-above
+    name: CRAP score
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
+
+      - name: Install libraries
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            libgtk-4-dev libadwaita-1-dev libgtk4-layer-shell-dev \
+            protobuf-compiler pkg-config
+
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+        with:
+          toolchain: stable
+
+      # A regression turns the check red and is commented on the pull request.
+      # It only blocks merging if the check is marked as required in the branch
+      # protection rules.
+      - name: cargo crap
+        uses: minikin/cargo-crap@49f67037505997092f3df41d7a88e4fbfa09daee # v1 (0.9.0)
+        with:
+          fail-above: "true"
