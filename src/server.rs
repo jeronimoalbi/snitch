@@ -643,6 +643,82 @@ mod tests {
         assert!(crate::checksum::find(&link.rules(), &con, now_secs()).is_empty());
     }
 
+    /// Real gRPC round trip of what the rules window does: add a rule, rename
+    /// it, then delete it, with the daemon confirming each step.
+    #[tokio::test]
+    async fn rule_changes_reach_the_daemon_over_grpc() {
+        use crate::proto::Action;
+        use crate::proto::ui_client::UiClient;
+
+        let (tx, _rx) = async_channel::unbounded::<PromptRequest>();
+        let service = Service::new(tx, PathBuf::from("/nonexistent/settings.conf"));
+        let link = service.link.clone();
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let _ = Server::builder()
+                .add_service(UiServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener))
+                .await;
+        });
+
+        let mut daemon = UiClient::connect(format!("http://{addr}")).await.unwrap();
+        let (replies, replies_rx) = mpsc::channel(4);
+        let mut inbox = daemon
+            .notifications(ReceiverStream::new(replies_rx))
+            .await
+            .unwrap()
+            .into_inner();
+        let names = || {
+            let mut names: Vec<String> = link.rules().into_iter().map(|r| r.name).collect();
+            names.sort();
+            names
+        };
+        let change = |name: &str| (Action::ChangeRule as i32, name.to_string());
+        let removal = |name: &str| (Action::DeleteRule as i32, name.to_string());
+        let updater = Updater::new(link.clone());
+
+        let confirmed = confirm_steps(&mut inbox, &replies, 1);
+        let (saved, seen) = tokio::join!(updater.save_rule(None, rule("a")), confirmed);
+        saved.unwrap();
+        assert_eq!(seen, [change("a")]);
+        assert_eq!(names(), ["a"]);
+
+        let confirmed = confirm_steps(&mut inbox, &replies, 2);
+        let rename = updater.save_rule(Some("a".into()), rule("b"));
+        let (saved, seen) = tokio::join!(rename, confirmed);
+        saved.unwrap();
+        assert_eq!(seen, [change("b"), removal("a")]);
+        assert_eq!(names(), ["b"]);
+
+        let confirmed = confirm_steps(&mut inbox, &replies, 1);
+        let (deleted, seen) = tokio::join!(updater.delete_rule("b".into()), confirmed);
+        deleted.unwrap();
+        assert_eq!(seen, [removal("b")]);
+        assert!(names().is_empty());
+    }
+
+    /// Acts as the daemon for `count` notifications, confirming each, and
+    /// returns their types and rule names.
+    async fn confirm_steps(
+        inbox: &mut Streaming<Notification>,
+        replies: &mpsc::Sender<NotificationReply>,
+        count: usize,
+    ) -> Vec<(i32, String)> {
+        let mut seen = Vec::new();
+        for _ in 0..count {
+            let notification = inbox.message().await.unwrap().unwrap();
+            let reply = NotificationReply {
+                id: notification.id,
+                code: crate::proto::NotificationReplyCode::Ok as i32,
+                data: String::new(),
+            };
+            replies.send(reply).await.unwrap();
+            seen.push((notification.r#type, notification.rules[0].name.clone()));
+        }
+        seen
+    }
+
     /// Builds one HTTP/2 frame.
     fn frame(kind: u8, flags: u8, stream: u32, payload: &[u8]) -> Vec<u8> {
         let len = u32::try_from(payload.len()).unwrap();

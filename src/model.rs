@@ -27,6 +27,12 @@ pub mod operand {
     pub const DEST_HOST: &str = "dest.host";
     pub const DEST_PORT: &str = "dest.port";
     pub const DEST_NETWORK: &str = "dest.network";
+    pub const USER_NAME: &str = "user.name";
+    pub const SOURCE_IP: &str = "source.ip";
+    pub const SOURCE_PORT: &str = "source.port";
+    pub const PROTOCOL: &str = "protocol";
+    pub const IFACE_OUT: &str = "iface.out";
+    pub const IFACE_IN: &str = "iface.in";
 }
 
 const APPIMAGE_PREFIX: &str = "/tmp/.mount_";

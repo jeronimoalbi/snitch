@@ -1,7 +1,16 @@
-//! Fake connections for `snitch --demo`, to preview the dialog without a daemon.
+//! Fake connections for `snitch --demo`, to preview the dialog without a daemon,
+//! and fake rules for `snitch --demo-rules`, to preview the rules window.
+
+use std::sync::Arc;
+
+use tokio::sync::mpsc;
 
 use crate::checksum::Mismatch;
-use crate::proto::{Connection, StringInt};
+use crate::link::Link;
+use crate::model::{kind, operand};
+use crate::proto::{
+    Connection, Notification, NotificationReply, NotificationReplyCode, Operator, Rule, StringInt,
+};
 
 /// Names accepted by `--demo-scenario`.
 pub const SCENARIOS: &[&str] = &[
@@ -143,9 +152,83 @@ pub fn mismatch(name: &str) -> Mismatch {
     }
 }
 
+fn condition(kind: &str, operand: &str, data: &str) -> Operator {
+    Operator {
+        r#type: kind.to_string(),
+        operand: operand.to_string(),
+        data: data.to_string(),
+        ..Default::default()
+    }
+}
+
+fn sample(name: &str, action: &str, duration: &str, operator: Operator, created: i64) -> Rule {
+    Rule {
+        created,
+        name: name.to_string(),
+        enabled: true,
+        action: action.to_string(),
+        duration: duration.to_string(),
+        operator: Some(operator),
+        ..Default::default()
+    }
+}
+
+/// Rules for the demo window: one of each shape, a value the form doesn't
+/// list, and a name that must not be taken for markup.
+pub fn rules(now: i64) -> Vec<Rule> {
+    let curl = condition(kind::SIMPLE, operand::PROCESS_PATH, "/usr/bin/curl");
+    let mut list = condition(kind::LIST, kind::LIST, "");
+    list.list = vec![
+        curl.clone(),
+        condition(kind::SIMPLE, operand::DEST_PORT, "443"),
+    ];
+    let host = condition(kind::REGEXP, operand::DEST_HOST, r"^(|.*\.)example\.com$");
+    let lan = condition(kind::NETWORK, operand::DEST_NETWORK, "LAN");
+    let range = condition("range", operand::DEST_PORT, "6000-6010");
+    let mut off = sample("deny-always-example", "deny", "always", host, now);
+    off.enabled = false;
+    vec![
+        sample("allow-always-simple-curl", "allow", "always", curl, now),
+        sample("allow-always-list-curl-443", "allow", "always", list, now),
+        off,
+        sample("reject-5m-lan", "reject", "5m", lan, now),
+        sample("hand-written-range", "allow", "until restart", range, now),
+        sample(
+            "<b>not-markup</b>",
+            "allow",
+            "always",
+            condition(kind::SIMPLE, operand::PROCESS_PATH, "/tmp/<i>x&"),
+            now,
+        ),
+    ]
+}
+
+/// Stands in for the daemon on `link`, accepting every change.
+pub fn accept_everything(link: Arc<Link>, runtime: &tokio::runtime::Handle) {
+    let (outbox, mut inbox) = mpsc::channel(8);
+    link.attach(outbox);
+    runtime.spawn(async move {
+        while let Some(Ok(Notification { id, .. })) = inbox.recv().await {
+            link.handle_reply(NotificationReply {
+                id,
+                code: NotificationReplyCode::Ok as i32,
+                data: String::new(),
+            });
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn demo_rules_have_unique_names() {
+        let rules = rules(1);
+        let names: std::collections::HashSet<&str> =
+            rules.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names.len(), rules.len());
+    }
 
     #[test]
     fn every_scenario_exists() {

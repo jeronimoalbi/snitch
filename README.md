@@ -74,8 +74,24 @@ Closing the window applies your default action. Escape does nothing, so a prompt
 can't be dismissed by accident.
 
 A "forever" rule is a file in `/etc/opensnitchd/rules/`, such as
-`allow-always-simple-usr-bin-curl.json`. To undo it, delete the file (needs
-root); restart the daemon if it doesn't notice.
+`allow-always-simple-usr-bin-curl.json`. To change or undo one, use the rules
+window.
+
+## Managing rules
+
+`snitch --rules` opens a window with the rules the daemon has loaded. On GNOME
+the [extension](contrib/gnome-extension/README.md) menu has a **Rules…** item.
+
+- The **switch** on a row turns that rule on or off.
+- **Add rule**, or click a row to edit it: name, action, duration and conditions.
+  All conditions must match. **Delete** is on the same page and asks first.
+- Saving replaces the rule at once. Changing the name saves a new rule and
+  removes the old one.
+- Editing a temporary rule keeps its time limit unless you change its name or
+  duration, which starts it again.
+
+Snitch learns the rules when the daemon connects, so a rule file edited by hand
+shows up after snitch or the daemon restarts.
 
 ## Defaults
 
@@ -131,8 +147,8 @@ there is nothing to restart. Edit it, use the Qt preferences, or use the
 - **`refused a connection from uid …`.** Something other than the daemon used
   the socket. If it was the daemon, it isn't running as root: start snitch with
   `--allow-uid <that user id>`.
-- **A rule blocks something it shouldn't.** Delete its file from
-  `/etc/opensnitchd/rules/`.
+- **A rule blocks something it shouldn't.** Turn it off or delete it in the
+  rules window (`snitch --rules`).
 
 ## Security
 
@@ -147,6 +163,10 @@ turn the firewall off. So snitch takes care:
   freely, but turning it off must pass polkit, so a program of yours can't do it
   silently. A paused firewall is turned back on when snitch or the daemon
   reconnects.
+- **Rules change only through snitch's own window.** Other programs can ask
+  over D-Bus for the rules window to open, nothing more; changing a rule takes
+  clicks in it. Rule names become root-owned file names, so a name holding `/`
+  is refused.
 - **Names can't widen a rule.** Patterns built from a program's path or a host
   name are escaped, and the AppImage and Snap patterns are only offered for the
   exact path shape those systems use. A program called `x|.*` can't turn
@@ -163,6 +183,9 @@ Plain `snitch` starts it normally.
 - `--demo`: show the dialog with a fake connection; nothing is sent or saved.
 - `--demo-scenario <name>`: demo with a scenario: `curl` (default), `appimage`,
   `snap`, `dns`, `lan`, `icmp`, `unknown` or `badchecksum`.
+- `--rules`: open the rules window of the running snitch.
+- `--demo-rules`: show the rules window with fake rules; nothing is sent or
+  saved.
 - `--socket <address>`: address to listen on instead of the saved one.
 - `--settings <path>`: Qt settings file (default
   `~/.config/opensnitch/settings.conf`).

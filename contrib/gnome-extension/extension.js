@@ -35,6 +35,7 @@ const INTERFACE_XML = `
     <property name="SettingsPath" type="s" access="read"/>
     <method name="Enable"/>
     <method name="Disable"/>
+    <method name="ShowRules"/>
   </interface>
 </node>`;
 
@@ -43,7 +44,7 @@ const SnitchProxy = Gio.DBusProxy.makeProxyWrapper(INTERFACE_XML);
 const UNIT = 'snitch.service';
 // Snitch's windows have its application id as their window class.
 const WINDOW_CLASS = 'io.github.jeronimoalbi.Snitch';
-// The prompt's title; snitch's other windows have another.
+// The prompt's title. Snitch's other windows have another and are left alone.
 const PROMPT_TITLE = 'OpenSnitch';
 
 // What the user's systemd says about the unit's autostart.
@@ -215,6 +216,9 @@ const Indicator = GObject.registerClass(
             this._onTopSwitch = new PopupMenu.PopupSwitchMenuItem('Keep prompt on top', this._onTop);
             this._onTopSwitch.connect('toggled', (_item, on) => this._setKeepOnTop(on));
 
+            this._rules = new PopupMenu.PopupMenuItem('Rules\u2026');
+            this._rules.connect('activate', () => this._showRules());
+
             this._prompt = new PopupMenu.PopupSubMenuMenuItem('Prompt defaults');
             this._steppers = {
                 action: new Stepper('Default action', ACTIONS,
@@ -255,6 +259,7 @@ const Indicator = GObject.registerClass(
             menu.addMenuItem(this._onTopSwitch);
             menu.addMenuItem(this._running);
             menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
+            menu.addMenuItem(this._rules);
             menu.addMenuItem(this._prompt);
             // The unit and the settings file can change outside the extension
             // (the Qt UI writes the file too), so look again each time.
@@ -291,18 +296,18 @@ const Indicator = GObject.registerClass(
             }
         }
 
-        // Keeps `window` above the others if it is one of snitch's. The class
+        // Keeps `window` above the others if it is snitch's prompt. The class
         // may be set after the window appears, so look again when it changes.
         _track(window, existing = false) {
             let arranged = existing;
             const apply = () => {
-                if (this._destroyed || window.get_wm_class() !== WINDOW_CLASS) {
+                if (this._destroyed || !this._isPrompt(window)) {
                     return;
                 }
                 this._place(window, this._onTop);
-                // Only the prompt (not other snitch windows), and only once,
-                // when it appears: not a window you may be answering already.
-                if (!arranged && window.get_title() === PROMPT_TITLE) {
+                // Only once, when it appears: not a window you may be
+                // answering already.
+                if (!arranged) {
                     arranged = true;
                     this._arrangeWhenDrawn(window);
                 }
@@ -310,6 +315,11 @@ const Indicator = GObject.registerClass(
             apply();
             window.connect('notify::wm-class', apply);
             window.connect('notify::title', apply);
+        }
+
+        _isPrompt(window) {
+            return window.get_wm_class() === WINDOW_CLASS &&
+                window.get_title() === PROMPT_TITLE;
         }
 
         // The size is known once the first frame is drawn.
@@ -376,7 +386,7 @@ const Indicator = GObject.registerClass(
             }
             for (const actor of global.get_window_actors()) {
                 const window = actor.meta_window;
-                if (window.get_wm_class() === WINDOW_CLASS) {
+                if (this._isPrompt(window)) {
                     this._place(window, on);
                 }
             }
@@ -476,6 +486,7 @@ const Indicator = GObject.registerClass(
             if (proxy) {
                 this._owned = owned;
             }
+            this._rules.setSensitive(owned);
             if (this._wanted === owned) {
                 this._clearWanted();
             }
@@ -580,6 +591,14 @@ const Indicator = GObject.registerClass(
                 if (!this._destroyed) {
                     this._sync();
                 }
+            }
+        }
+
+        async _showRules() {
+            try {
+                await this._proxy.ShowRulesAsync();
+            } catch (error) {
+                Main.notifyError('Snitch', Gio.DBusError.strip_remote_error(error) ?? `${error}`);
             }
         }
 

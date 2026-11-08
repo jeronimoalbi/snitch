@@ -71,6 +71,8 @@ pub struct Link {
     pending: Mutex<HashMap<u64, oneshot::Sender<Verdict>>>,
     next_id: AtomicU64,
     status: watch::Sender<DaemonState>,
+    /// Counts changes to `rules`, so an open window can follow them.
+    revision: watch::Sender<u64>,
     /// A file that exists while interception is paused, so a restart of this
     /// program turns it back on instead of forgetting it.
     pause_marker: OnceLock<PathBuf>,
@@ -84,6 +86,7 @@ impl Default for Link {
             pending: Mutex::default(),
             next_id: AtomicU64::default(),
             status: watch::channel(DaemonState::default()).0,
+            revision: watch::channel(0).0,
             pause_marker: OnceLock::new(),
         }
     }
@@ -99,16 +102,30 @@ fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 impl Link {
     /// Replaces the known rules with the daemon's list (sent on `Subscribe`).
     pub fn replace_rules(&self, rules: Vec<Rule>) {
-        let mut known = lock(&self.rules);
-        known.clear();
-        known.extend(rules.into_iter().map(|r| (r.name.clone(), r)));
+        {
+            let mut known = lock(&self.rules);
+            known.clear();
+            known.extend(rules.into_iter().map(|r| (r.name.clone(), r)));
+        }
+        self.announce_rules();
     }
 
     /// Records a rule the daemon is about to keep.
     pub fn remember(&self, rule: &Rule) {
         if rule.duration != "once" {
             lock(&self.rules).insert(rule.name.clone(), rule.clone());
+            self.announce_rules();
         }
+    }
+
+    /// Tells whoever follows the rules that they changed.
+    fn announce_rules(&self) {
+        self.revision.send_modify(|revision| *revision += 1);
+    }
+
+    /// Receives a new value every time the known rules change.
+    pub fn watch_rules(&self) -> watch::Receiver<u64> {
+        self.revision.subscribe()
     }
 
     /// Copy of the known rules.
@@ -247,6 +264,39 @@ impl Link {
         verdict
     }
 
+    /// Asks the daemon to add `rule`, or to replace the rule with its name.
+    ///
+    /// When `original` names another rule this is a rename, which the daemon
+    /// sees as a new rule. The new one is saved first, so a failure can leave
+    /// both rules but never neither.
+    async fn save_rule(&self, original: Option<String>, rule: Rule) -> Verdict {
+        let renamed = original.filter(|old| *old != rule.name);
+        self.change_rule(rule).await?;
+        match renamed {
+            Some(old) => self.delete_rule(&old).await.map_err(|err| {
+                format!("Saved under the new name, but the old rule ({old}) is still there: {err}")
+            }),
+            None => Ok(()),
+        }
+    }
+
+    /// Asks the daemon to remove the rule called `name` and waits for its answer.
+    async fn delete_rule(&self, name: &str) -> Verdict {
+        self.request(|id| Notification {
+            id,
+            r#type: Action::DeleteRule as i32,
+            rules: vec![Rule {
+                name: name.to_string(),
+                ..Default::default()
+            }],
+            ..Default::default()
+        })
+        .await?;
+        lock(&self.rules).remove(name);
+        self.announce_rules();
+        Ok(())
+    }
+
     /// Asks the daemon to start or stop intercepting connections. The state
     /// changes only when the daemon confirms.
     pub async fn set_interception(&self, on: bool) -> Verdict {
@@ -322,6 +372,35 @@ impl Updater {
     /// Receives every change of [`DaemonState`].
     pub fn watch(&self) -> watch::Receiver<DaemonState> {
         self.link.watch()
+    }
+
+    /// Copy of the rules the daemon has loaded.
+    pub fn rules(&self) -> Vec<Rule> {
+        self.link.rules()
+    }
+
+    /// Receives a new value every time the known rules change.
+    pub fn watch_rules(&self) -> watch::Receiver<u64> {
+        self.link.watch_rules()
+    }
+
+    /// Adds or replaces `rule`, removing the rule called `original` if that
+    /// is another one.
+    pub async fn save_rule(&self, original: Option<String>, rule: Rule) -> Result<(), String> {
+        let link = self.link.clone();
+        let task = self
+            .runtime
+            .spawn(async move { link.save_rule(original, rule).await });
+        task.await.unwrap_or_else(|err| Err(err.to_string()))
+    }
+
+    /// Removes the rule called `name`.
+    pub async fn delete_rule(&self, name: String) -> Result<(), String> {
+        let link = self.link.clone();
+        let task = self
+            .runtime
+            .spawn(async move { link.delete_rule(&name).await });
+        task.await.unwrap_or_else(|err| Err(err.to_string()))
     }
 
     /// Starts or stops interception.
@@ -463,6 +542,154 @@ mod tests {
             .error
             .unwrap();
         assert!(err.contains("not found"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn deleting_a_rule_tells_the_daemon_and_forgets_it() {
+        let link = Arc::new(Link::default());
+        link.replace_rules(vec![rule("a", "x"), rule("b", "x")]);
+        let mut seen = daemon(&link, NotificationReplyCode::Ok);
+
+        link.delete_rule("a").await.unwrap();
+        let sent = seen.recv().await.unwrap();
+        assert_eq!(sent.r#type, Action::DeleteRule as i32);
+        assert_eq!(sent.rules[0].name, "a");
+        let names: Vec<String> = link.rules().into_iter().map(|r| r.name).collect();
+        assert_eq!(names, ["b"]);
+    }
+
+    #[tokio::test]
+    async fn a_refused_delete_keeps_the_rule() {
+        let link = Arc::new(Link::default());
+        link.replace_rules(vec![rule("a", "x")]);
+        let _seen = daemon(&link, NotificationReplyCode::Error);
+
+        let err = link.delete_rule("a").await.unwrap_err();
+        assert!(err.contains("boom"), "{err}");
+        assert_eq!(link.rules().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn saving_a_new_rule_only_changes() {
+        let link = Arc::new(Link::default());
+        let mut seen = daemon(&link, NotificationReplyCode::Ok);
+
+        link.save_rule(None, rule("a", "x")).await.unwrap();
+        assert_eq!(seen.recv().await.unwrap().r#type, Action::ChangeRule as i32);
+        assert!(seen.try_recv().is_err());
+        assert_eq!(link.rules().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn saving_under_the_same_name_deletes_nothing() {
+        let link = Arc::new(Link::default());
+        link.replace_rules(vec![rule("a", "x")]);
+        let mut seen = daemon(&link, NotificationReplyCode::Ok);
+
+        link.save_rule(Some("a".into()), rule("a", "y"))
+            .await
+            .unwrap();
+        assert_eq!(seen.recv().await.unwrap().r#type, Action::ChangeRule as i32);
+        assert!(seen.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn renaming_saves_the_new_rule_before_deleting_the_old() {
+        let link = Arc::new(Link::default());
+        link.replace_rules(vec![rule("old", "x")]);
+        let mut seen = daemon(&link, NotificationReplyCode::Ok);
+
+        link.save_rule(Some("old".into()), rule("new", "x"))
+            .await
+            .unwrap();
+        let first = seen.recv().await.unwrap();
+        assert_eq!(first.r#type, Action::ChangeRule as i32);
+        assert_eq!(first.rules[0].name, "new");
+        let second = seen.recv().await.unwrap();
+        assert_eq!(second.r#type, Action::DeleteRule as i32);
+        assert_eq!(second.rules[0].name, "old");
+        let names: Vec<String> = link.rules().into_iter().map(|r| r.name).collect();
+        assert_eq!(names, ["new"]);
+    }
+
+    /// OK for `ChangeRule`, an error for anything else.
+    fn change_only_reply(n: &Notification) -> NotificationReply {
+        let code = if n.r#type == Action::ChangeRule as i32 {
+            NotificationReplyCode::Ok
+        } else {
+            NotificationReplyCode::Error
+        };
+        NotificationReply {
+            id: n.id,
+            code: code as i32,
+            data: "boom".into(),
+        }
+    }
+
+    /// A fake daemon that accepts changes and refuses deletes.
+    fn daemon_refusing_deletes(link: &Arc<Link>) {
+        let (outbox, mut inbox) = mpsc::channel::<Result<Notification, Status>>(8);
+        link.attach(outbox);
+        let link = link.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(n)) = inbox.recv().await {
+                link.handle_reply(change_only_reply(&n));
+            }
+        });
+    }
+
+    #[tokio::test]
+    async fn a_rename_whose_delete_fails_says_both_rules_exist() {
+        let link = Arc::new(Link::default());
+        link.replace_rules(vec![rule("old", "x")]);
+        daemon_refusing_deletes(&link);
+
+        let err = link
+            .save_rule(Some("old".into()), rule("new", "x"))
+            .await
+            .unwrap_err();
+        assert!(err.contains("old") && err.contains("boom"), "{err}");
+        assert_eq!(link.rules().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn a_refused_change_is_not_remembered_and_stops_a_rename() {
+        let link = Arc::new(Link::default());
+        link.replace_rules(vec![rule("old", "x")]);
+        let mut seen = daemon(&link, NotificationReplyCode::Error);
+
+        assert!(
+            link.save_rule(Some("old".into()), rule("new", "x"))
+                .await
+                .is_err()
+        );
+        assert_eq!(seen.recv().await.unwrap().r#type, Action::ChangeRule as i32);
+        assert!(seen.try_recv().is_err());
+        let names: Vec<String> = link.rules().into_iter().map(|r| r.name).collect();
+        assert_eq!(names, ["old"]);
+    }
+
+    #[tokio::test]
+    async fn every_change_to_the_rules_is_announced() {
+        let link = Arc::new(Link::default());
+        let _seen = daemon(&link, NotificationReplyCode::Ok);
+        let mut changes = link.watch_rules();
+
+        link.replace_rules(vec![rule("a", "x")]);
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+
+        link.remember(&rule("b", "x"));
+        assert!(changes.has_changed().unwrap());
+        changes.borrow_and_update();
+
+        let mut once = rule("o", "x");
+        once.duration = "once".into();
+        link.remember(&once);
+        assert!(!changes.has_changed().unwrap());
+
+        link.delete_rule("a").await.unwrap();
+        assert!(changes.has_changed().unwrap());
     }
 
     #[test]

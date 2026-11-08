@@ -5,8 +5,10 @@
 
 use std::path::{Component, Path};
 
-use crate::model::command_line;
-use crate::proto::{Connection, Rule};
+use crate::draft::{ACTIONS, label_of};
+use crate::model::{command_line, kind};
+use crate::proto::{Connection, Operator, Rule};
+use crate::rule::DURATIONS;
 
 /// Escapes `text` for use inside Pango markup.
 pub fn escape_markup(text: &str) -> String {
@@ -111,6 +113,51 @@ pub fn connection_summary(con: &Connection) -> String {
         printable(program),
         printable(&con.protocol)
     )
+}
+
+/// Longest one-line description of a rule, in characters.
+const MAX_SUMMARY: usize = 160;
+
+/// One condition of a rule as text.
+fn condition_summary(op: &Operator) -> String {
+    let sign = match op.r#type.as_str() {
+        kind::SIMPLE => "=",
+        kind::REGEXP => "~",
+        kind::NETWORK => "in",
+        other => other,
+    };
+    format!("{} {sign} {}", op.operand, op.data)
+}
+
+/// What a rule does and matches, on one line. Rules hold names that came from
+/// programs and DNS answers, so control characters are dropped.
+pub fn rule_summary(rule: &Rule) -> String {
+    let matches = match &rule.operator {
+        Some(op) if op.r#type == kind::LIST => op
+            .list
+            .iter()
+            .map(condition_summary)
+            .collect::<Vec<_>>()
+            .join(", "),
+        Some(op) => condition_summary(op),
+        None => String::new(),
+    };
+    let duration = DURATIONS
+        .iter()
+        .find(|(_, value)| *value == rule.duration)
+        .map_or(rule.duration.as_str(), |(label, _)| *label);
+    let action = label_of(&ACTIONS, &rule.action);
+    truncate(
+        &printable(&format!("{action} \u{b7} {duration} \u{b7} {matches}")),
+        MAX_SUMMARY,
+    )
+}
+
+/// True when any of `texts` holds `query`, ignoring case. An empty or blank
+/// query matches everything.
+pub fn matches_search(query: &str, texts: &[&str]) -> bool {
+    let query = query.trim().to_lowercase();
+    texts.iter().any(|t| t.to_lowercase().contains(&query))
 }
 
 /// Directories only root can write to. A program installed there is what its
@@ -442,6 +489,78 @@ mod tests {
             body.starts_with("&lt;i&gt;evil&amp; to &lt;a href=\"x\"&gt;:443 (TCP)\n"),
             "{body}"
         );
+    }
+
+    fn rule_with(operator: Operator) -> Rule {
+        Rule {
+            action: "allow".into(),
+            duration: "always".into(),
+            operator: Some(operator),
+            ..Default::default()
+        }
+    }
+
+    fn operator(kind: &str, operand: &str, data: &str) -> Operator {
+        Operator {
+            r#type: kind.into(),
+            operand: operand.into(),
+            data: data.into(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn a_simple_rule_is_summarised() {
+        assert_eq!(
+            rule_summary(&rule_with(operator(
+                "simple",
+                "process.path",
+                "/usr/bin/curl"
+            ))),
+            "Allow \u{b7} forever \u{b7} process.path = /usr/bin/curl"
+        );
+    }
+
+    #[test]
+    fn a_list_rule_shows_every_condition() {
+        let mut list = operator("list", "list", "");
+        list.list = vec![
+            operator("regexp", "dest.host", "^a$"),
+            operator("network", "dest.network", "LAN"),
+        ];
+        let mut rule = rule_with(list);
+        rule.action = "deny".into();
+        rule.duration = "30s".into();
+        assert_eq!(
+            rule_summary(&rule),
+            "Drop \u{b7} 30s \u{b7} dest.host ~ ^a$, dest.network in LAN"
+        );
+    }
+
+    #[test]
+    fn summaries_of_hand_written_rules_show_the_raw_values() {
+        let mut rule = rule_with(operator("range", "dest.port", "1-9"));
+        rule.action = "odd".into();
+        rule.duration = "2h".into();
+        assert_eq!(
+            rule_summary(&rule),
+            "odd \u{b7} 2h \u{b7} dest.port range 1-9"
+        );
+    }
+
+    #[test]
+    fn summaries_are_one_short_line() {
+        let long = format!("a\nb{}", "x".repeat(500));
+        let text = rule_summary(&rule_with(operator("simple", "process.path", &long)));
+        assert!(!text.contains('\n'));
+        assert!(text.chars().count() <= MAX_SUMMARY + 3);
+    }
+
+    #[test]
+    fn search_ignores_case_and_looks_in_every_text() {
+        assert!(matches_search("CURL", &["rule", "/usr/bin/curl"]));
+        assert!(matches_search("  ", &["anything"]));
+        assert!(!matches_search("wget", &["rule", "/usr/bin/curl"]));
     }
 
     #[test]

@@ -109,7 +109,7 @@ fn to_operator(op: &Op) -> Operator {
 }
 
 /// Maximum rule name length, so `<name>.json` stays a valid file name.
-const MAX_NAME: usize = 200;
+pub const MAX_NAME: usize = 200;
 
 /// Builds the rule for `choice`; `None` when the main operator has no data.
 pub fn build_rule(con: &Connection, choice: &Choice, created: i64) -> Option<Rule> {

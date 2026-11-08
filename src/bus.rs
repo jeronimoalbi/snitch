@@ -35,18 +35,20 @@ const XML: &str = r#"
     <property name="SettingsPath" type="s" access="read"/>
     <method name="Enable"/>
     <method name="Disable"/>
+    <method name="ShowRules"/>
   </interface>
 </node>"#;
 
 /// Starts offering the service on the session bus.
 /// `settings` is the OpenSnitch settings file snitch reads, offered as the
-/// `SettingsPath` property so other programs edit the same file.
-pub fn serve(updater: Updater, settings: PathBuf) {
+/// `SettingsPath` property so other programs edit the same file. A request to
+/// see the rules window is sent on `show_rules`.
+pub fn serve(updater: Updater, settings: PathBuf, show_rules: async_channel::Sender<()>) {
     gio::bus_own_name(
         BusType::Session,
         NAME,
         BusNameOwnerFlags::DO_NOT_QUEUE,
-        move |connection, _| match register(&connection, &updater, &settings) {
+        move |connection, _| match register(&connection, &updater, &settings, &show_rules) {
             Ok(()) => tracing::info!("D-Bus service {NAME} ready"),
             Err(err) => tracing::warn!("cannot offer {NAME} on D-Bus: {err}"),
         },
@@ -59,6 +61,7 @@ fn register(
     connection: &DBusConnection,
     updater: &Updater,
     settings: &Path,
+    show_rules: &async_channel::Sender<()>,
 ) -> Result<(), glib::Error> {
     let node = gio::DBusNodeInfo::for_xml(XML)?;
     let interface = node
@@ -68,10 +71,11 @@ fn register(
     let calls = updater.clone();
     let reads = updater.clone();
     let settings = settings.to_path_buf();
+    let show_rules = show_rules.clone();
     connection
         .register_object(PATH, &interface)
         .method_call(move |connection, sender, _, _, method, _, invocation| {
-            call(&calls, &connection, sender, method, invocation);
+            call(&calls, &show_rules, &connection, sender, method, invocation);
         })
         .property(move |_, _, _, _, name| property(reads.status(), &settings, name))
         .build()?;
@@ -156,6 +160,7 @@ fn failed(message: impl AsRef<str>) -> glib::Error {
 
 fn call(
     updater: &Updater,
+    show_rules: &async_channel::Sender<()>,
     connection: &DBusConnection,
     sender: Option<&str>,
     method: &str,
@@ -185,8 +190,32 @@ fn call(
                     .map_err(failed)
             });
         }
+        // Only opens a window, where changing anything takes a person's clicks,
+        // so unlike `Disable` it needs no authorisation. A request while one
+        // is pending is the same request, so a full channel is fine.
+        ("ShowRules", _) => {
+            let _ = show_rules.try_send(());
+            invocation.return_value(None);
+        }
         _ => invocation.return_error(gio::DBusError::UnknownMethod, "no such method"),
     }
+}
+
+/// Asks the running snitch to open its rules window.
+pub fn request_rules_window() -> Result<(), glib::Error> {
+    let session = gio::bus_get_sync(BusType::Session, None::<&gio::Cancellable>)?;
+    session.call_sync(
+        Some(NAME),
+        PATH,
+        INTERFACE,
+        "ShowRules",
+        None,
+        None,
+        gio::DBusCallFlags::NO_AUTO_START,
+        5_000,
+        None::<&gio::Cancellable>,
+    )?;
+    Ok(())
 }
 
 /// Asks polkit whether the process behind `sender` (a name on the session
@@ -301,6 +330,7 @@ mod tests {
         let interface = node.lookup_interface(INTERFACE).unwrap();
         assert!(interface.lookup_method("Enable").is_some());
         assert!(interface.lookup_method("Disable").is_some());
+        assert!(interface.lookup_method("ShowRules").is_some());
         assert!(interface.lookup_property("Interception").is_some());
     }
 

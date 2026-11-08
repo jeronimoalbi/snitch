@@ -7,9 +7,11 @@ mod bus;
 mod checksum;
 mod demo;
 mod dialog;
+mod draft;
 mod link;
 mod model;
 mod rule;
+mod rules_window;
 mod server;
 mod settings;
 mod view;
@@ -17,13 +19,14 @@ mod view;
 use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gtk4::gio::ApplicationFlags;
 use gtk4::glib;
 use libadwaita as adw;
 use libadwaita::prelude::*;
 
-use crate::link::Updater;
+use crate::link::{Link, Updater};
 use crate::server::{PromptRequest, Service};
 use crate::settings::{DEFAULT_ADDRESS, Settings};
 
@@ -44,6 +47,8 @@ USAGE: snitch [OPTIONS]
 OPTIONS:
     --demo                   Show the dialog with a fake connection and print the rule
     --demo-scenario <NAME>   Demo scenario (implies --demo); default: curl
+    --demo-rules             Show the rules window with fake rules; nothing is sent or saved
+    --rules                  Open the rules window of the running snitch
     --socket <ADDRESS>       Address to listen on (default: the Qt UI setting, else unix:///tmp/osui.sock)
     --settings <PATH>        Qt UI settings file (default: ~/.config/opensnitch/settings.conf)
     --allow-uid <UID>        Let this user, besides root, act as the daemon (repeatable)
@@ -53,6 +58,9 @@ OPTIONS:
 #[derive(Debug, Default)]
 struct Args {
     demo: Option<String>,
+    demo_rules: bool,
+    /// Ask the running snitch to open its rules window, then exit.
+    rules: bool,
     socket: Option<String>,
     settings: Option<PathBuf>,
     /// User ids, besides root, that may act as the daemon.
@@ -78,6 +86,8 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, St
                 }
                 out.demo = Some(name);
             }
+            "--demo-rules" => out.demo_rules = true,
+            "--rules" => out.rules = true,
             "--socket" => out.socket = Some(value("--socket")?),
             "--settings" => out.settings = Some(PathBuf::from(value("--settings")?)),
             "--allow-uid" => {
@@ -109,6 +119,10 @@ fn main() -> glib::ExitCode {
         }
     };
 
+    if args.rules {
+        return open_rules_window();
+    }
+
     let app = adw::Application::builder()
         .application_id(APP_ID)
         .flags(ApplicationFlags::NON_UNIQUE)
@@ -117,6 +131,10 @@ fn main() -> glib::ExitCode {
     app.connect_activate(move |app| {
         // No window exists between prompts, so keep the application alive.
         std::mem::forget(app.hold());
+        if args.demo_rules {
+            run_demo_rules(app);
+            return;
+        }
         let settings_path = args.settings.clone().unwrap_or_else(Settings::default_path);
         match &args.demo {
             Some(name) => run_demo(app, name, &settings_path),
@@ -129,6 +147,37 @@ fn main() -> glib::ExitCode {
         }
     });
     app.run_with_args::<String>(&[])
+}
+
+/// Asks the running snitch for its rules window.
+fn open_rules_window() -> glib::ExitCode {
+    match bus::request_rules_window() {
+        Ok(()) => glib::ExitCode::SUCCESS,
+        Err(err) => {
+            eprintln!(
+                "snitch: cannot open the rules window, is snitch running? ({})",
+                err.message()
+            );
+            glib::ExitCode::FAILURE
+        }
+    }
+}
+
+/// Shows the rules window with fake rules, against a stand-in for the daemon.
+fn run_demo_rules(app: &adw::Application) {
+    let runtime = start_runtime();
+    let link = Arc::new(Link::default());
+    link.replace_rules(demo::rules(dialog::now_secs()));
+    demo::accept_everything(link.clone(), runtime.handle());
+    let updater = Updater::on(link, runtime.handle().clone());
+    // The stand-in runs on it until the process ends.
+    std::mem::forget(runtime);
+
+    let app = app.clone();
+    rules_window::show(&app, updater).connect_close_request(move |_| {
+        app.quit();
+        glib::Propagation::Proceed
+    });
 }
 
 /// Shows one fake prompt, prints the resulting rule and exits.
@@ -234,7 +283,15 @@ fn run_daemon(
     let runtime = start_runtime();
     let updater = Updater::on(link, runtime.handle().clone());
     spawn_server(runtime, address, service, allow_uids);
-    bus::serve(updater, bus_settings);
+    let (show_rules, rules_requests) = async_channel::bounded::<()>(1);
+    bus::serve(updater.clone(), bus_settings, show_rules);
+
+    let rules_app = app.clone();
+    glib::spawn_future_local(async move {
+        while rules_requests.recv().await.is_ok() {
+            rules_window::show(&rules_app, updater.clone());
+        }
+    });
 
     // Prompts are handled one after another on the GTK thread.
     let prompt_app = app.clone();
@@ -360,6 +417,14 @@ mod tests {
             Some("curl")
         );
         assert!(parse(&["--help"]).unwrap().is_none());
+    }
+
+    #[test]
+    fn parses_the_rules_flags() {
+        assert!(parse(&["--rules"]).unwrap().unwrap().rules);
+        assert!(parse(&["--demo-rules"]).unwrap().unwrap().demo_rules);
+        let none = parse(&[]).unwrap().unwrap();
+        assert!(!none.rules && !none.demo_rules);
     }
 
     #[test]

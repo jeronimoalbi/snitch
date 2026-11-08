@@ -12,9 +12,11 @@ A click opens a menu with:
   While snitch is stopped nothing asks you: the daemon applies its own default.
 - **Start snitch on login**: enables or disables `snitch.service`.
 - **Keep prompt on top**: on by default. GNOME lets no program stay on top
-  by itself, so the extension does it for snitch's windows. It doesn't take
+  by itself, so the extension does it for snitch's prompt. It doesn't take
   keyboard focus, so it can't catch what you are typing. Saved in
   `~/.config/snitch/gnome-extension.ini`.
+- **Rules…**: opens snitch's window to add, edit, turn off and delete rules.
+  Greyed out while snitch isn't running.
 - **Prompt defaults**: action, duration, what to apply to, time to answer,
   position and the advanced checks, as in the Qt preferences. GNOME lets a
   program place no window itself, so the extension moves the prompt to the
@@ -75,7 +77,8 @@ Crossed-out eye: check `systemctl --user status snitch`. Extension errors are in
 Snitch offers `io.github.jeronimoalbi.Snitch` at
 `/io/github/jeronimoalbi/Snitch` on the session bus. Properties: `Version`
 (currently 1), `Interception` (`on`/`off`/`unknown`), `Connected`,
-`SettingsPath`. Methods: `Enable()` and `Disable()` (polkit-checked).
+`SettingsPath`. Methods: `Enable()`, `Disable()` (polkit-checked) and
+`ShowRules()`, which opens the rules window.
 
 ```sh
 gdbus call --session --dest io.github.jeronimoalbi.Snitch \

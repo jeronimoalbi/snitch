@@ -62,7 +62,8 @@ pub async fn prompt(
     answer.recv().await.unwrap_or_default()
 }
 
-fn now_secs() -> i64 {
+/// Seconds since the Unix epoch.
+pub fn now_secs() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(0))
@@ -81,7 +82,8 @@ fn desktop_info(path: &str) -> Option<gtk::gio::AppInfo> {
         .find(|app| view::same_program(&app.executable(), wanted))
 }
 
-fn label(text: &str) -> gtk::Label {
+/// A left-aligned wrapping label.
+pub fn label(text: &str) -> gtk::Label {
     let l = gtk::Label::new(Some(text));
     l.set_xalign(0.0);
     l.set_wrap(true);
@@ -89,7 +91,7 @@ fn label(text: &str) -> gtk::Label {
 }
 
 /// A vertical box with the window's content margins.
-fn padded_box(spacing: i32) -> gtk::Box {
+pub fn padded_box(spacing: i32) -> gtk::Box {
     let b = gtk::Box::new(gtk::Orientation::Vertical, spacing);
     b.set_margin_top(MARGIN);
     b.set_margin_bottom(MARGIN);
