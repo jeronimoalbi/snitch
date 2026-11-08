@@ -166,39 +166,51 @@ fn call(
     method: &str,
     invocation: DBusMethodInvocation,
 ) {
-    let updater = updater.clone();
     match (method, sender) {
-        ("Enable", _) => {
-            invocation.return_future_local(async move {
-                updater
-                    .set_interception(true)
-                    .await
-                    .map(|()| None)
-                    .map_err(failed)
-            });
-        }
-        ("Disable", Some(sender)) => {
-            let connection = connection.clone();
-            let sender = sender.to_string();
-            invocation.return_future_local(async move {
-                authorize(&connection, &sender).await?;
-                tracing::info!("interception paused by an authorised request");
-                updater
-                    .set_interception(false)
-                    .await
-                    .map(|()| None)
-                    .map_err(failed)
-            });
-        }
-        // Only opens a window, where changing anything takes a person's clicks,
-        // so unlike `Disable` it needs no authorisation. A request while one
-        // is pending is the same request, so a full channel is fine.
-        ("ShowRules", _) => {
-            let _ = show_rules.try_send(());
-            invocation.return_value(None);
-        }
+        ("Enable", _) => enable(updater.clone(), invocation),
+        ("Disable", Some(sender)) => disable(updater.clone(), connection, sender, invocation),
+        ("ShowRules", _) => show_rules_window(show_rules, invocation),
         _ => invocation.return_error(gio::DBusError::UnknownMethod, "no such method"),
     }
+}
+
+/// Handles `Enable`, which can only make the firewall stricter.
+fn enable(updater: Updater, invocation: DBusMethodInvocation) {
+    invocation.return_future_local(async move {
+        updater
+            .set_interception(true)
+            .await
+            .map(|()| None)
+            .map_err(failed)
+    });
+}
+
+/// Handles `Disable`, once polkit has authorised the caller.
+fn disable(
+    updater: Updater,
+    connection: &DBusConnection,
+    sender: &str,
+    invocation: DBusMethodInvocation,
+) {
+    let connection = connection.clone();
+    let sender = sender.to_string();
+    invocation.return_future_local(async move {
+        authorize(&connection, &sender).await?;
+        tracing::info!("interception paused by an authorised request");
+        updater
+            .set_interception(false)
+            .await
+            .map(|()| None)
+            .map_err(failed)
+    });
+}
+
+/// Handles `ShowRules`. It only opens a window, where changing anything takes
+/// a person's clicks, so unlike `Disable` it needs no authorisation. A request
+/// while one is pending is the same request, so a full channel is fine.
+fn show_rules_window(show_rules: &async_channel::Sender<()>, invocation: DBusMethodInvocation) {
+    let _ = show_rules.try_send(());
+    invocation.return_value(None);
 }
 
 /// Asks the running snitch to open its rules window.

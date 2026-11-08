@@ -77,48 +77,75 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Args>, St
                 out.demo.get_or_insert_with(|| "curl".to_string());
             }
             "--demo-scenario" => {
-                let name = value("--demo-scenario")?;
-                if demo::scenario(&name).is_none() {
-                    return Err(format!(
-                        "unknown scenario '{name}', try: {}",
-                        demo::SCENARIOS.join(", ")
-                    ));
-                }
-                out.demo = Some(name);
+                out.demo = Some(value("--demo-scenario").and_then(known_scenario)?);
             }
             "--demo-rules" => out.demo_rules = true,
             "--rules" => out.rules = true,
             "--socket" => out.socket = Some(value("--socket")?),
             "--settings" => out.settings = Some(PathBuf::from(value("--settings")?)),
-            "--allow-uid" => {
-                let uid = value("--allow-uid")?;
-                let uid = uid
-                    .parse()
-                    .map_err(|_| format!("--allow-uid needs a user id, not '{uid}'"))?;
-                out.allow_uids.push(uid);
-            }
+            "--allow-uid" => out.allow_uids.push(value("--allow-uid").and_then(user_id)?),
             other => return Err(format!("unknown argument '{other}'")),
         }
     }
     Ok(Some(out))
 }
 
+/// `name`, when it is a demo scenario.
+fn known_scenario(name: String) -> Result<String, String> {
+    if demo::scenario(&name).is_none() {
+        return Err(format!(
+            "unknown scenario '{name}', try: {}",
+            demo::SCENARIOS.join(", ")
+        ));
+    }
+    Ok(name)
+}
+
+/// The value of `--allow-uid` as a number.
+fn user_id(text: String) -> Result<u32, String> {
+    text.parse()
+        .map_err(|_| format!("--allow-uid needs a user id, not '{text}'"))
+}
+
+/// Starts what `args` asked for, once the application is up.
+fn activate(app: &adw::Application, args: &Args) {
+    // No window exists between prompts, so keep the application alive.
+    std::mem::forget(app.hold());
+    if args.demo_rules {
+        run_demo_rules(app);
+        return;
+    }
+    let settings_path = args.settings.clone().unwrap_or_else(Settings::default_path);
+    match &args.demo {
+        Some(name) => run_demo(app, name, &settings_path),
+        None => run_daemon(
+            app,
+            args.socket.clone(),
+            settings_path,
+            args.allow_uids.clone(),
+        ),
+    }
+}
+
 fn main() -> glib::ExitCode {
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
         .init();
-    let args = match parse_args(std::env::args().skip(1)) {
-        Ok(Some(args)) => args,
+    match parse_args(std::env::args().skip(1)) {
+        Ok(Some(args)) => run(args),
         Ok(None) => {
             println!("{USAGE}");
-            return glib::ExitCode::SUCCESS;
+            glib::ExitCode::SUCCESS
         }
         Err(err) => {
             eprintln!("snitch: {err}\n\n{USAGE}");
-            return glib::ExitCode::FAILURE;
+            glib::ExitCode::FAILURE
         }
-    };
+    }
+}
 
+/// Does what the command line asked for, until the program should exit.
+fn run(args: Args) -> glib::ExitCode {
     if args.rules {
         return open_rules_window();
     }
@@ -127,25 +154,7 @@ fn main() -> glib::ExitCode {
         .application_id(APP_ID)
         .flags(ApplicationFlags::NON_UNIQUE)
         .build();
-    let args = Rc::new(args);
-    app.connect_activate(move |app| {
-        // No window exists between prompts, so keep the application alive.
-        std::mem::forget(app.hold());
-        if args.demo_rules {
-            run_demo_rules(app);
-            return;
-        }
-        let settings_path = args.settings.clone().unwrap_or_else(Settings::default_path);
-        match &args.demo {
-            Some(name) => run_demo(app, name, &settings_path),
-            None => run_daemon(
-                app,
-                args.socket.clone(),
-                settings_path,
-                args.allow_uids.clone(),
-            ),
-        }
-    });
+    app.connect_activate(move |app| activate(app, &args));
     app.run_with_args::<String>(&[])
 }
 
@@ -261,6 +270,19 @@ fn spawn_server(
     });
 }
 
+/// Opens the rules window every time `requests` delivers a request.
+fn open_rules_on_request(
+    app: adw::Application,
+    requests: async_channel::Receiver<()>,
+    updater: Updater,
+) {
+    glib::spawn_future_local(async move {
+        while requests.recv().await.is_ok() {
+            rules_window::show(&app, updater.clone());
+        }
+    });
+}
+
 /// Starts the gRPC server and shows a dialog for every `AskRule` it receives.
 fn run_daemon(
     app: &adw::Application,
@@ -285,13 +307,7 @@ fn run_daemon(
     spawn_server(runtime, address, service, allow_uids);
     let (show_rules, rules_requests) = async_channel::bounded::<()>(1);
     bus::serve(updater.clone(), bus_settings, show_rules);
-
-    let rules_app = app.clone();
-    glib::spawn_future_local(async move {
-        while rules_requests.recv().await.is_ok() {
-            rules_window::show(&rules_app, updater.clone());
-        }
-    });
+    open_rules_on_request(app.clone(), rules_requests, updater);
 
     // Prompts are handled one after another on the GTK thread.
     let prompt_app = app.clone();
